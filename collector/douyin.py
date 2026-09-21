@@ -765,8 +765,16 @@ class DouyinCollector:
         try:
             page.goto(VIDEO_URL.format(aweme_id=aweme_id), wait_until="domcontentloaded", timeout=45000)
             # Wait for the first comment page instead of a blind 5-6.5s sleep:
-            # on a warm connection this returns in well under a second.
-            self._await_response(page, lambda: response_count, mark=0, timeout_ms=FIRST_COMMENT_WAIT_MS)
+            # on a warm connection this returns in well under a second. The
+            # container check covers videos whose comments are empty, where no
+            # comment request is ever made.
+            self._await_response(
+                page,
+                lambda: response_count,
+                mark=0,
+                timeout_ms=FIRST_COMMENT_WAIT_MS,
+                also_ready=self._comment_list_present,
+            )
             title = self._page_title()
             if is_blocked_page(title):
                 raise CollectorError("抖音返回了验证码页，请在浏览器窗口里过验证后重试。")
@@ -830,17 +838,29 @@ class DouyinCollector:
         *,
         mark: int,
         timeout_ms: int,
+        also_ready: Callable[[], bool] | None = None,
+        poll_ready_every: int = 4,
     ) -> bool:
         """Pump the event loop until a response lands past `mark`, else time out.
 
         `page.wait_for_timeout` is what dispatches Playwright's events, so a
         plain `time.sleep` here would stall delivery of the very responses we
-        are waiting for. Returns True if new data arrived.
+        are waiting for. Returns True if new data (or the alternative signal)
+        arrived.
+
+        `also_ready` is an escape hatch for the first page: a video with zero
+        comments never fires a comment request at all, so waiting purely on the
+        counter would burn the whole budget every time. It is polled every
+        `poll_ready_every` pumps because each check costs a round-trip.
         """
         waited = 0
         guard = 0
+        pumps = 0
         while waited < timeout_ms:
             if counter() > mark:
+                return True
+            pumps += 1
+            if also_ready is not None and pumps % poll_ready_every == 0 and also_ready():
                 return True
             step = min(POLL_STEP_MS, timeout_ms - waited)
             try:
@@ -852,6 +872,17 @@ class DouyinCollector:
             if guard > 400:  # belt and braces against a pathological clock
                 break
         return counter() > mark
+
+    COMMENT_LIST_JS = """
+    () => !!document.querySelector('[data-e2e="comment-list"], [data-e2e="comment-item"]')
+    """
+
+    def _comment_list_present(self) -> bool:
+        """True once the comment container is on the page, empty or not."""
+        try:
+            return bool(self._page.evaluate(self.COMMENT_LIST_JS))
+        except Exception:
+            return False
 
     COMMENT_LIST_SELECTOR = '[data-e2e="comment-list"], [data-e2e="comment-item"]'
 
@@ -917,17 +948,24 @@ class DouyinCollector:
 
     AT_BOTTOM_JS = """
     () => {
+      const anchor = document.querySelector('[data-e2e="comment-list"], [data-e2e="comment-item"]');
+      // Not rendered yet: do not claim we are done, or we would quit early.
+      if (!anchor) return false;
       const hittable = (el) => {
         const style = getComputedStyle(el);
         if (!/(auto|scroll)/.test(style.overflowY)) return 0;
         return el.scrollHeight - el.clientHeight;
       };
-      let node = document.querySelector('[data-e2e="comment-list"], [data-e2e="comment-item"]');
+      let node = anchor;
       while (node && node !== document.body) {
         if (hittable(node) > 40) break;
         node = node.parentElement;
       }
-      if (!node || node === document.body) return false;
+      // No scrollable ancestor at all: the comments already fit on screen, so
+      // there is nothing left to load. This is the common case for a video with
+      // a handful of comments, and reporting it avoids waiting out the stall
+      // budget on every such video.
+      if (!node || node === document.body) return true;
       // A few pixels of slack: sub-pixel layout and lazy-load spinners mean the
       // scroller rarely reports an exact 0 remaining.
       return node.scrollTop + node.clientHeight >= node.scrollHeight - 8;
