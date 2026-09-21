@@ -533,6 +533,7 @@ async function collectDouyin() {
     .map((work) => ({ aweme_id: work.awemeId, desc: work.desc }));
   const maxComments = clamp(Number($("douyin-max").value), 20, 2000);
   const includeReplies = $("douyin-replies").checked;
+  const startedAt = Date.now();
 
   setBusy(true);
   $("douyin-collect").querySelector("span:first-child").textContent = "抓取中…";
@@ -578,9 +579,24 @@ async function collectDouyin() {
     setBusy(false);
   }
 
+  // 已经跑完了——把耗时一并报出来，否则用户无法判断是快是慢。
+  const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+  const workCount = awemeIds.length;
+
   if (!finished || !finished.rows || !finished.rows.length) {
-    $("douyin-note").textContent = "没有抓到可分析的评论。作品可能没有评论，或触发了风控。";
-    $("status-text").textContent = "没有抓到评论";
+    // 区分「作品本来就没评论」和「抓取过程真的出错了」。原来一律提示
+    // 「可能触发了风控」，会把只是还没人评论的作品说成账号出了事。
+    const failed = (finished && finished.errors) || [];
+    if (failed.length) {
+      $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · ${failed.length} 个抓取失败：${failed[0].error}`;
+      $("status-text").textContent = "抓取出错";
+    } else if (finished && finished.skippedNoText) {
+      $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · 只找到 ${finished.skippedNoText} 条纯图片评论，没有可分析的文字。`;
+      $("status-text").textContent = "只有图片评论";
+    } else {
+      $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · 这些作品目前还没有文字评论，没有可分析的内容。`;
+      $("status-text").textContent = "没有抓到评论";
+    }
     return;
   }
 
@@ -590,7 +606,7 @@ async function collectDouyin() {
   // 前端还要按单次上限截断，所以用实际选中条数报数，避免两个数字打架。
   const toAnalyze = getSelectedRows().length;
   const capped = toAnalyze < finished.count ? `，本次送去筛选前 ${toAnalyze} 条（单次上限 ${finished.analyzeLimit}）` : "";
-  $("douyin-note").textContent = `已抓取 ${finished.count} 条可分析评论${skipped}${capped}，正在送去筛选…`;
+  $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · 抓到 ${finished.count} 条可分析评论${skipped}${capped}，正在送去筛选…`;
   $("max-rows-hint").textContent = `本次抓到 ${finished.count} 条，单次最多分析 ${finished.analyzeLimit} 条`;
   // 用户要的就是「抓完自动筛选」，所以这里直接接上分析。
   await analyze();

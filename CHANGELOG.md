@@ -15,11 +15,13 @@
 - **命令行 `collect` 直接崩**：`tools/radar-collect.py` 传给采集器的进度回调是「服务事件 dict」形状，而采集器回调是 `(count, title)` 形状，第一次真跑就 `TypeError`。已改为正确签名，并加契约测试。
 - **账号昵称显示成「开启读屏标签」**：原来在个人主页抓 DOM，兜底逻辑取的是页面正文第一行，那是抖音的界面文案。现在从 `aweme/post` 响应里的 `author.nickname` 读取（权威来源），兜底也只在明确的昵称节点上取。
 - **输入框能填 10000 但上限是 2000**：现在失焦时自动收敛到合法值并给出提示。
+- **「没抓到评论」被说成「可能触发了风控」**：作品本来就没评论是最常见的情况，原来的提示会让人以为账号出了问题。现在区分三种原因分别说明——抓取出错（报出具体错误）、只有纯图片评论、以及**作品确实还没有文字评论**；同时把**耗时和作品数**一并报出来，用户才能判断快慢。
+- **进度提示显示上一个作品的标题**：标题原来是读页面 `document.title`，这个 SPA 上会滞后一拍，导致每个作品的头几秒显示的是前一个视频的名字。现在优先用作品列表里已有的标题（免费且准确），拿不到才回退到页面标题。
 
 ### 测试
 
-- 采集器测试 59 → 77 项，新增：`CollectionLoopTests`（用「脚本化假页面」钉住「够了就停 / 到底就停 / 不再空睡」）、`AwaitResponseTests`、`ParseAuthorNicknameTests`、`ScrollBudgetTests`、`CliProgressContractTests`。
-- 全量 **192 项**（165 Python + 27 JS）全部通过。
+- 采集器测试 59 → 80 项，新增：`CollectionLoopTests`（用「脚本化假页面」钉住「够了就停 / 到底就停 / 不再空睡」）、`AwaitResponseTests`、`ParseAuthorNicknameTests`、`ScrollBudgetTests`、`CliProgressContractTests`、`CollectProgressTitleTests`。
+- 全量 **195 项**（168 Python + 27 JS）全部通过。
 
 ## 0.3.0 — 直接抓取抖音作品评论
 

@@ -184,15 +184,20 @@ class CollectorService:
             if w.get("aweme_id")
         }
 
-        def on_progress(count: int, title: str) -> None:
-            if progress is not None:
-                progress({"type": "progress", "count": count, "title": title})
-
         all_comments: list[douyin.Comment] = []
         errors: list[dict[str, str]] = []
         for index, aweme_id in enumerate(params["awemeIds"]):
             if progress is not None:
                 progress({"type": "work", "index": index, "awemeId": aweme_id})
+            known = works_by_id.get(aweme_id)
+            known_title = (known.desc if known else "") or ""
+
+            def on_progress(count: int, title: str, _known: str = known_title) -> None:
+                # Prefer the title we already have from the works list. Reading
+                # it off the page lags on this SPA, so the first ticks of every
+                # work would show the *previous* video's name.
+                if progress is not None:
+                    progress({"type": "progress", "count": count, "title": _known or title})
             try:
                 # maxScrolls is only honoured when explicitly pinned; otherwise
                 # the collector derives a budget from maxComments, which is what

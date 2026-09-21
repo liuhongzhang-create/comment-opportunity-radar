@@ -510,6 +510,44 @@ class EnvironmentProbeTests(unittest.TestCase):
             self.assertIn("error", info)
 
 
+class CollectProgressTitleTests(unittest.TestCase):
+    """Progress must name the work we are actually on.
+
+    Regression: the title came from the page, which lags on this SPA, so the
+    first ticks of every work displayed the previous video's name.
+    """
+
+    class _FakeCollector:
+        def collect_comments(self, _aweme_id, **kwargs):
+            kwargs["on_progress"](7, "从页面读到的滞后标题")
+            return []
+
+    def _titles(self, works):
+        from collector.service import CollectorService
+
+        service = CollectorService(profile_dir="/tmp/radar-test-profile")
+        events: list[dict] = []
+        service._collect(
+            self._FakeCollector(),
+            {
+                "awemeIds": ["111"],
+                "works": works,
+                "maxComments": 20,
+            },
+            events.append,
+        )
+        return [event["title"] for event in events if event.get("type") == "progress"]
+
+    def test_prefers_the_title_we_already_know(self):
+        self.assertEqual(self._titles([{"aweme_id": "111", "desc": "我自己的作品标题"}]), ["我自己的作品标题"])
+
+    def test_falls_back_to_the_page_title_for_an_unknown_work(self):
+        self.assertEqual(self._titles([]), ["从页面读到的滞后标题"])
+
+    def test_falls_back_when_the_known_title_is_blank(self):
+        self.assertEqual(self._titles([{"aweme_id": "111", "desc": ""}]), ["从页面读到的滞后标题"])
+
+
 class ParseAuthorNicknameTests(unittest.TestCase):
     """The nickname must come from the payload, not the profile DOM.
 
