@@ -7,10 +7,14 @@ or a threshold key that exists in one language and not the other.
 
 import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 INDEX = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
 APP_JS = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
 CORE_JS = (ROOT / "web" / "core.js").read_text(encoding="utf-8")
@@ -127,6 +131,57 @@ class BadgeStyleTests(unittest.TestCase):
             name for name in used if name not in JS_ONLY_CLASSES and f".{name}" not in CSS
         )
         self.assertEqual(missing, [], f"unstyled classes in index.html: {missing}")
+
+
+class DouyinWiringTests(unittest.TestCase):
+    """The collection flow crosses Python, HTML and JS; pin the seams."""
+
+    def test_every_collection_endpoint_the_ui_calls_exists_in_the_server(self):
+        called = set(re.findall(r'"(/api/douyin/[a-z]+)"', APP_JS))
+        self.assertTrue(called, "前端没有调用任何抓取接口")
+        server_source = (ROOT / "app.py").read_text(encoding="utf-8")
+        for endpoint in sorted(called):
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, server_source)
+
+    def test_collect_endpoint_rejects_what_the_ui_thought_it_sent(self):
+        """The server must validate the same limits the form advertises."""
+        server_source = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn("MAX_COLLECT", server_source)
+        self.assertIn('"awemeIds"', server_source)
+
+    def test_comment_column_is_detectable_by_the_frontend_heuristic(self):
+        """web/app.js picks the default text column by a regex; it must match."""
+        from collector import douyin
+
+        pattern = re.search(r"/评论\|内容\|文本\|comment\|content\|text/i", APP_JS)
+        self.assertIsNotNone(pattern, "前端的列自动识别正则变了，请同步检查 CSV 表头")
+        matches = [name for name in douyin.CSV_HEADER if re.search(pattern.group()[1:-2], name, re.I)]
+        self.assertEqual(matches, ["评论内容"])
+
+    def test_collected_rows_only_carry_columns_the_header_declares(self):
+        from collector import douyin
+
+        row = douyin.comment_rows(
+            [douyin.parse_comment({"cid": "1", "text": "怎么买", "user": {"nickname": "小林"}})], {}
+        )[0]
+        self.assertEqual(len(row), len(douyin.CSV_HEADER))
+
+    def test_share_url_column_is_present_so_export_can_link_back_to_the_video(self):
+        from collector import douyin
+
+        self.assertIn("作品链接", douyin.CSV_HEADER)
+        self.assertIn("主页链接", douyin.CSV_HEADER)
+
+    def test_works_payload_shape_matches_what_render_works_reads(self):
+        from collector import douyin
+        from collector.service import CollectorService
+
+        payload = CollectorService._work_dict(douyin.Work(aweme_id="123", desc="标题", comment_count=7))
+        for key in ("awemeId", "title", "desc", "commentCount", "createdAt"):
+            with self.subTest(key=key):
+                self.assertIn(key, payload)
+                self.assertIn(key, APP_JS)
 
 
 class CrossLanguageContractTests(unittest.TestCase):

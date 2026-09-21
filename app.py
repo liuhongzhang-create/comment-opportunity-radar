@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Local server for Comment Opportunity Radar.
 
-No third-party packages are required. The browser talks only to this local
-server; the server forwards evaluation requests to TypeSafe's official API.
+The analysis path needs no third-party packages: the browser talks only to this
+local server, and the server forwards evaluation requests to TypeSafe's official
+API. The optional Douyin collection path additionally needs Playwright, which is
+kept out of the core dependency list — see tools/setup-collector.sh.
 
 Environment variables:
-    RADAR_HOST        bind address (default 127.0.0.1)
-    RADAR_PORT        bind port (default 8765)
-    RADAR_API_BASE    override the TypeSafe base URL (used by the test suite)
-    RADAR_MODEL       default model id (default jev-1.13.0, pinned on purpose)
-    RADAR_PROXY       proxy URL for outbound calls; "direct" forces no proxy
+    RADAR_HOST             bind address (default 127.0.0.1)
+    RADAR_PORT             bind port (default 8765)
+    RADAR_API_BASE         override the TypeSafe base URL (used by the test suite)
+    RADAR_MODEL            default model id (default jev-1.13.0, pinned on purpose)
+    RADAR_PROXY            proxy URL for outbound calls; "direct" forces no proxy
+    RADAR_BROWSER_PROFILE  browser profile dir used for the Douyin session
+    RADAR_BROWSER_CHANNEL  Chrome channel for the collector (default chrome)
 """
 
 from __future__ import annotations
@@ -17,11 +21,13 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -418,6 +424,52 @@ def analyze_rows(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Douyin collection — optional; needs Playwright via tools/setup-collector.sh
+# ---------------------------------------------------------------------------
+
+MAX_COLLECT = 2000
+
+
+def collector_available() -> tuple[bool, str]:
+    """Whether the Douyin collector can run here, and why not when it cannot."""
+    try:
+        from collector import douyin
+    except Exception as error:  # noqa: BLE001 - reported to the UI
+        return False, f"采集模块不可用：{error}"
+    info = douyin.probe_environment()
+    if not info.get("playwright"):
+        return False, str(info.get("error") or "缺少 Playwright")
+    return True, ""
+
+
+def collector_service():
+    from collector.service import get_service
+
+    return get_service()
+
+
+def douyin_status(refresh: bool = False) -> dict[str, Any]:
+    available, reason = collector_available()
+    if not available:
+        return {
+            "available": False,
+            "error": reason,
+            "running": False,
+            "loggedIn": False,
+            "nickname": "",
+            "profile": "",
+            "analyzeLimit": MAX_ROWS,
+        }
+    status = collector_service().status(refresh=refresh)
+    return {
+        "available": True,
+        "error": status.get("lastError", ""),
+        "analyzeLimit": MAX_ROWS,
+        **status,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "OpportunityRadar/0.2"
 
@@ -455,6 +507,12 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_analyze()
         elif self.path == "/api/verify":
             self.handle_verify()
+        elif self.path == "/api/douyin/login":
+            self.handle_douyin_login()
+        elif self.path == "/api/douyin/collect":
+            self.handle_douyin_collect()
+        elif self.path == "/api/douyin/shutdown":
+            self.handle_douyin_shutdown()
         else:
             self.send_json(404, {"error": "Not found"})
 
@@ -535,9 +593,125 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, {"ok": True, "models": models})
 
+    # -- Douyin collection --------------------------------------------------
+
+    def handle_douyin_login(self) -> None:
+        available, reason = collector_available()
+        if not available:
+            self.send_json(400, {"error": reason})
+            return
+        try:
+            service = collector_service()
+            info = service.call("login_open", timeout=180)
+        except Exception as error:  # noqa: BLE001
+            self.send_json(200, {"ok": False, "error": str(error), "status": douyin_status()})
+            return
+        self.send_json(
+            200,
+            {
+                "ok": True,
+                "loggedIn": bool(info.get("loggedIn")),
+                "title": info.get("title", ""),
+                "status": douyin_status(),
+            },
+        )
+
+    def handle_douyin_shutdown(self) -> None:
+        try:
+            collector_service().call("shutdown", timeout=90)
+        except Exception as error:  # noqa: BLE001
+            self.send_json(200, {"ok": False, "error": str(error)})
+            return
+        self.send_json(200, {"ok": True, "status": douyin_status()})
+
+    def handle_douyin_collect(self) -> None:
+        available, reason = collector_available()
+        if not available:
+            self.send_json(400, {"error": reason})
+            return
+        try:
+            payload = self.read_payload()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.send_json(400, {"error": str(error)})
+            return
+
+        aweme_ids = [str(x).strip() for x in (payload.get("awemeIds") or []) if str(x).strip()]
+        if not aweme_ids:
+            self.send_json(400, {"error": "请先选择要抓取的作品"})
+            return
+        if len(aweme_ids) > 50:
+            self.send_json(400, {"error": "一次最多抓取 50 个作品，请减少后重试"})
+            return
+
+        params = {
+            "awemeIds": aweme_ids,
+            "works": payload.get("works") or [],
+            "maxComments": max(1, min(MAX_COLLECT, int(payload.get("maxComments") or 300))),
+            "maxScrolls": max(2, min(400, int(payload.get("maxScrolls") or 60))),
+            "includeReplies": bool(payload.get("includeReplies")),
+        }
+        try:
+            self.stream_douyin_collect(params)
+        except Exception as error:  # noqa: BLE001 - headers may already be sent
+            try:
+                self.send_json(500, {"error": str(error)})
+            except Exception:
+                pass
+
+    def stream_douyin_collect(self, params: dict[str, Any]) -> None:
+        """Relay collector progress as NDJSON, then the harvested rows."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Connection", "close")
+        self._common_headers()
+        self.end_headers()
+        self.close_connection = True
+
+        def write_line(value: dict[str, Any]) -> None:
+            self.wfile.write((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+        write_line({"type": "start", "works": len(params["awemeIds"])})
+
+        events: queue.Queue[Any] = queue.Queue()
+        outcome: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                outcome["value"] = collector_service().call(
+                    "collect", on_progress=lambda event: events.put(event), timeout=3600, **params
+                )
+            except Exception as error:  # noqa: BLE001
+                outcome["error"] = str(error)
+            finally:
+                events.put(None)
+
+        threading.Thread(target=run, name="radar-collect-job", daemon=True).start()
+        while True:
+            event = events.get()
+            if event is None:
+                break
+            write_line(event)
+
+        if "error" in outcome:
+            write_line({"type": "error", "error": outcome["error"]})
+            return
+        payload = outcome.get("value") or {}
+        write_line(
+            {
+                "type": "done",
+                "count": payload.get("count", 0),
+                "skippedNoText": payload.get("skippedNoText", 0),
+                "header": payload.get("header", []),
+                "rows": payload.get("rows", []),
+                "errors": payload.get("errors", []),
+                "analyzeLimit": MAX_ROWS,
+            }
+        )
+
     # -- GET ----------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path == "/api/config":
             self.send_json(
                 200,
@@ -555,6 +729,32 @@ class Handler(BaseHTTPRequestHandler):
                     "proxy": proxy_in_use(),
                 },
             )
+            return
+
+        params = urllib.parse.parse_qs(query)
+        if path == "/api/douyin/status":
+            refresh = params.get("refresh", ["0"])[0] not in {"0", "", "false"}
+            try:
+                self.send_json(200, douyin_status(refresh=refresh))
+            except Exception as error:  # noqa: BLE001
+                self.send_json(200, {"available": False, "error": str(error), "loggedIn": False})
+            return
+
+        if path == "/api/douyin/works":
+            available, reason = collector_available()
+            if not available:
+                self.send_json(400, {"error": reason})
+                return
+            try:
+                limit = max(1, min(200, int(params.get("limit", ["60"])[0])))
+            except ValueError:
+                limit = 60
+            try:
+                works = collector_service().call("works", limit=limit, timeout=600)
+            except Exception as error:  # noqa: BLE001
+                self.send_json(200, {"ok": False, "error": str(error), "works": []})
+                return
+            self.send_json(200, {"ok": True, "works": works})
             return
 
         relative = "index.html" if path in {"", "/"} else path.lstrip("/")
@@ -587,12 +787,21 @@ def main() -> None:
     print(f"模型：{DEFAULT_MODEL}    上游：{API_BASE}")
     if proxy_in_use():
         print(f"出站代理：{proxy_in_use()}")
+    available, reason = collector_available()
+    print("抖音抓取：" + ("可用" if available else f"不可用（{reason}）"))
+    if not available:
+        print("  需要抓取功能时运行：bash tools/setup-collector.sh，并用 .venv/bin/python app.py 启动")
     print("按 Ctrl+C 停止。API Key 不会写入磁盘。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止。")
     finally:
+        if available:
+            try:
+                collector_service().shutdown()
+            except Exception:
+                pass
         server.server_close()
 
 

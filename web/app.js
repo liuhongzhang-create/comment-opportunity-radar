@@ -28,7 +28,9 @@ const intentLabels = {
 };
 
 const SETTINGS_KEY = "radar.settings.v2";
-const IDENTITY_PATTERN = /昵称|用户|作者|账号|达人|昵称|username|nickname|user|author|name/i;
+const IDENTITY_PATTERN = /昵称|用户名|用户|作者|账号|达人|nickname|username|user|author|name/i;
+// 用于表格展示：优先显示昵称，纯 ID 对人不友好。导出不受影响，导出始终带全部列。
+const DISPLAY_NAME_PATTERN = /昵称|用户名|昵称|nickname/i;
 
 const THRESHOLD_FIELDS = [
   ["review_confidence", "thr-review"],
@@ -135,12 +137,14 @@ async function loadConfig() {
 // --------------------------------------------------------------------------
 
 function detectIdentityColumn(headers) {
+  const displayName = headers.findIndex((header) => DISPLAY_NAME_PATTERN.test(header));
+  if (displayName >= 0) return displayName;
   return headers.findIndex((header) => IDENTITY_PATTERN.test(header));
 }
 
 function updateAnalyzeState() {
   const selected = getSelectedRows();
-  analyzeButton.disabled = state.running || !apiKey.value.trim() || selected.length === 0;
+  analyzeButton.disabled = state.running || douyin.busy || !apiKey.value.trim() || selected.length === 0;
   $("row-count").textContent = selected.length;
 }
 
@@ -332,6 +336,300 @@ function retryFailed() {
 }
 
 // --------------------------------------------------------------------------
+// Douyin collection
+// --------------------------------------------------------------------------
+
+const douyin = {
+  status: null,
+  works: [],
+  selected: new Set(),
+  busy: false,
+  pollTimer: null,
+};
+
+function setDouyinStatus(text, kind) {
+  const node = $("douyin-status");
+  node.textContent = text;
+  node.className = `douyin-status${kind ? ` ${kind}` : ""}`;
+}
+
+function setBusy(busy) {
+  douyin.busy = busy;
+  $("douyin-login").disabled = busy;
+  $("douyin-refresh").disabled = busy || !(douyin.status && douyin.status.loggedIn);
+  $("douyin-collect").disabled = busy || douyin.selected.size === 0;
+  updateAnalyzeState();
+}
+
+function renderDouyinStatus() {
+  const status = douyin.status;
+  if (!status) return;
+  if (!status.available) {
+    setDouyinStatus("抓取不可用", "bad");
+    $("douyin-account").textContent = "";
+    const hint = $("douyin-setup-hint");
+    hint.hidden = false;
+    hint.textContent = `${status.error || "缺少运行环境"} —— 在项目目录执行 bash tools/setup-collector.sh，然后用 .venv/bin/python app.py 重新启动服务。`;
+    $("douyin-login").disabled = true;
+    return;
+  }
+  $("douyin-setup-hint").hidden = true;
+  if (status.loggedIn) {
+    setDouyinStatus("已登录", "ok");
+    $("douyin-account").textContent = status.nickname ? `@${status.nickname}` : "抖音账号";
+  } else if (status.running) {
+    setDouyinStatus("浏览器已打开，等待扫码", "busy");
+    $("douyin-account").textContent = "";
+  } else {
+    setDouyinStatus("未登录", "");
+    $("douyin-account").textContent = "";
+  }
+  $("douyin-shutdown").hidden = !status.running;
+  $("douyin-login").disabled = douyin.busy;
+  $("douyin-refresh").disabled = douyin.busy || !status.loggedIn;
+}
+
+async function loadDouyinStatus(refresh) {
+  try {
+    const response = await fetch(`/api/douyin/status${refresh ? "?refresh=1" : ""}`);
+    douyin.status = await response.json();
+  } catch (error) {
+    douyin.status = { available: false, error: "无法连接本地服务", loggedIn: false };
+  }
+  renderDouyinStatus();
+  return douyin.status;
+}
+
+function stopLoginPolling() {
+  if (douyin.pollTimer) {
+    clearInterval(douyin.pollTimer);
+    douyin.pollTimer = null;
+  }
+}
+
+function pollLoginThenLoadWorks() {
+  stopLoginPolling();
+  let attempts = 0;
+  douyin.pollTimer = setInterval(async () => {
+    attempts += 1;
+    const status = await loadDouyinStatus(true);
+    if (status.loggedIn) {
+      stopLoginPolling();
+      setDouyinStatus("登录成功", "ok");
+      showToast("抖音登录成功，正在读取作品列表…");
+      loadWorks().catch((error) => showToast(error.message));
+      return;
+    }
+    if (attempts > 80) {
+      stopLoginPolling();
+      setDouyinStatus("等待扫码超时", "bad");
+    }
+  }, 3000);
+}
+
+async function openDouyinLogin() {
+  if (douyin.busy) return;
+  setBusy(true);
+  setDouyinStatus("正在打开浏览器…", "busy");
+  try {
+    const response = await fetch("/api/douyin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const payload = await response.json();
+    douyin.status = payload.status || douyin.status;
+    renderDouyinStatus();
+    if (!payload.ok) throw new Error(payload.error || "无法打开浏览器");
+    if (payload.loggedIn) {
+      showToast("已经登录过了，直接读取作品列表");
+      await loadWorks();
+    } else {
+      setDouyinStatus("请在浏览器窗口扫码登录", "busy");
+      showToast("已打开浏览器，请用抖音 App 扫码登录");
+      pollLoginThenLoadWorks();
+    }
+  } catch (error) {
+    setDouyinStatus("打开浏览器失败", "bad");
+    showToast(error.message);
+  } finally {
+    setBusy(false);
+    renderDouyinStatus();
+  }
+}
+
+async function shutdownDouyinBrowser() {
+  stopLoginPolling();
+  try {
+    await fetch("/api/douyin/shutdown", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+    douyin.works = [];
+    douyin.selected.clear();
+    renderWorks();
+    await loadDouyinStatus(false);
+    showToast("已关闭抓取用的浏览器");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function loadWorks() {
+  if (douyin.busy) return;
+  setBusy(true);
+  setDouyinStatus("正在读取作品列表…", "busy");
+  try {
+    const response = await fetch("/api/douyin/works?limit=60");
+    const payload = await response.json();
+    if (!payload.ok) throw new Error(payload.error || "读取作品列表失败");
+    douyin.works = payload.works || [];
+    douyin.selected.clear();
+    renderWorks();
+    setDouyinStatus(`已读取 ${douyin.works.length} 个作品`, "ok");
+    if (!douyin.works.length) showToast("这个账号下没有读到公开作品");
+  } catch (error) {
+    setDouyinStatus("读取作品失败", "bad");
+    showToast(error.message);
+  } finally {
+    setBusy(false);
+    renderDouyinStatus();
+  }
+}
+
+function renderWorks() {
+  const shell = $("works-shell");
+  const body = $("works-body");
+  if (!douyin.works.length) {
+    shell.hidden = true;
+    body.innerHTML = "";
+    $("works-summary").textContent = "";
+    setBusy(douyin.busy);
+    return;
+  }
+  shell.hidden = false;
+  body.innerHTML = douyin.works
+    .map((work) => {
+      const checked = douyin.selected.has(work.awemeId) ? " checked" : "";
+      const created = work.createdAt ? `<span>${escapeHtml(work.createdAt)}</span>` : "";
+      return `<label class="work-item">
+        <input type="checkbox" value="${escapeHtml(work.awemeId)}"${checked} />
+        <span>
+          <span class="work-title">${escapeHtml(work.title)}</span>
+          <span class="work-meta">${created}<span>评论 ${Number(work.commentCount || 0)}</span></span>
+        </span>
+        <span class="work-badge">${escapeHtml(work.awemeId.slice(-6))}</span>
+      </label>`;
+    })
+    .join("");
+  const total = douyin.works.reduce((sum, work) => sum + Number(work.commentCount || 0), 0);
+  $("works-summary").textContent = `共 ${douyin.works.length} 个作品 · 评论区合计约 ${total} 条`;
+  $("works-select-all").checked = douyin.selected.size === douyin.works.length;
+  setBusy(douyin.busy);
+}
+
+async function collectDouyin() {
+  if (douyin.busy || !douyin.selected.size) return;
+  const awemeIds = Array.from(douyin.selected);
+  const works = douyin.works
+    .filter((work) => douyin.selected.has(work.awemeId))
+    .map((work) => ({ aweme_id: work.awemeId, desc: work.desc }));
+  const maxComments = clamp(Number($("douyin-max").value), 20, 2000);
+  const includeReplies = $("douyin-replies").checked;
+
+  setBusy(true);
+  $("douyin-collect").querySelector("span:first-child").textContent = "抓取中…";
+  $("empty-state").hidden = true;
+  $("table-shell").hidden = false;
+  $("status-text").textContent = "正在抓取抖音评论";
+  $("douyin-note").textContent = "正在打开视频页并滚动评论区，请勿关闭浏览器窗口…";
+  setProgress(0, awemeIds.length, `0 / ${awemeIds.length} 个作品`);
+
+  let finished = null;
+  try {
+    const response = await fetch("/api/douyin/collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ awemeIds, works, maxComments, includeReplies, stream: true }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `抓取失败（HTTP ${response.status}）`);
+    }
+    await consumeStreamWith(response, (event) => {
+      if (event.type === "start") {
+        setDouyinStatus(`准备抓取 ${event.works} 个作品`, "busy");
+      } else if (event.type === "work") {
+        setProgress(event.index, awemeIds.length, `第 ${event.index + 1} / ${awemeIds.length} 个作品`);
+      } else if (event.type === "progress") {
+        $("douyin-note").textContent = `已抓取 ${event.count} 条 · 当前作品：${(event.title || "").slice(0, 24)}`;
+      } else if (event.type === "note") {
+        $("douyin-note").textContent = `已跳过 ${event.skippedNoText} 条纯图片评论（没有文字，无法分析）`;
+      } else if (event.type === "error") {
+        showToast(event.error);
+      } else if (event.type === "done") {
+        finished = event;
+      }
+    });
+  } catch (error) {
+    $("douyin-note").textContent = "";
+    $("status-text").textContent = "抓取中断";
+    showToast(error.message);
+    return;
+  } finally {
+    $("douyin-collect").querySelector("span:first-child").textContent = "开始抓取";
+    setBusy(false);
+  }
+
+  if (!finished || !finished.rows || !finished.rows.length) {
+    $("douyin-note").textContent = "没有抓到可分析的评论。作品可能没有评论，或触发了风控。";
+    $("status-text").textContent = "没有抓到评论";
+    return;
+  }
+
+  const skipped = finished.skippedNoText ? `，跳过 ${finished.skippedNoText} 条纯图片评论` : "";
+  setDouyinStatus(`抓取完成 ${finished.count} 条`, "ok");
+  setDataset([finished.header, ...finished.rows], `抖音评论 · ${finished.count} 条`);
+  // 前端还要按单次上限截断，所以用实际选中条数报数，避免两个数字打架。
+  const toAnalyze = getSelectedRows().length;
+  const capped = toAnalyze < finished.count ? `，本次送去筛选前 ${toAnalyze} 条（单次上限 ${finished.analyzeLimit}）` : "";
+  $("douyin-note").textContent = `已抓取 ${finished.count} 条可分析评论${skipped}${capped}，正在送去筛选…`;
+  $("max-rows-hint").textContent = `本次抓到 ${finished.count} 条，单次最多分析 ${finished.analyzeLimit} 条`;
+  // 用户要的就是「抓完自动筛选」，所以这里直接接上分析。
+  await analyze();
+}
+
+async function consumeStreamWith(response, handler) {
+  if (!response.body || !response.body.getReader) {
+    handler(await response.json());
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (line) handler(JSON.parse(line));
+      newline = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.trim()) handler(JSON.parse(buffer.trim()));
+}
+
+function selectSource(name) {
+  const isDouyin = name === "douyin";
+  $("source-tab-douyin").classList.toggle("is-active", isDouyin);
+  $("source-tab-csv").classList.toggle("is-active", !isDouyin);
+  $("source-tab-douyin").setAttribute("aria-selected", String(isDouyin));
+  $("source-tab-csv").setAttribute("aria-selected", String(!isDouyin));
+  $("douyin-panel").hidden = !isDouyin;
+  $("csv-panel").hidden = isDouyin;
+}
+
+// --------------------------------------------------------------------------
 // Rendering
 // --------------------------------------------------------------------------
 
@@ -457,8 +755,39 @@ $("sample-button").addEventListener("click", () => {
     ],
     "示例评论.csv"
   );
+  selectSource("csv");
   showToast("已载入 5 条示例评论；填写 API Key 后即可分析");
 });
+
+// -- Douyin wiring ----------------------------------------------------------
+
+$("source-tab-douyin").addEventListener("click", () => selectSource("douyin"));
+$("source-tab-csv").addEventListener("click", () => selectSource("csv"));
+$("douyin-login").addEventListener("click", openDouyinLogin);
+$("douyin-refresh").addEventListener("click", () => loadWorks().catch((error) => showToast(error.message)));
+$("douyin-shutdown").addEventListener("click", shutdownDouyinBrowser);
+$("douyin-collect").addEventListener("click", collectDouyin);
+
+$("works-body").addEventListener("change", (event) => {
+  const input = event.target;
+  if (!input || input.type !== "checkbox") return;
+  if (input.checked) douyin.selected.add(input.value);
+  else douyin.selected.delete(input.value);
+  $("works-select-all").checked = douyin.selected.size === douyin.works.length;
+  $("douyin-collect").disabled = douyin.busy || douyin.selected.size === 0;
+  $("douyin-note").textContent = douyin.selected.size
+    ? `已选择 ${douyin.selected.size} 个作品`
+    : "";
+});
+
+$("works-select-all").addEventListener("change", (event) => {
+  douyin.selected.clear();
+  if (event.target.checked) douyin.works.forEach((work) => douyin.selected.add(work.awemeId));
+  renderWorks();
+  $("douyin-note").textContent = douyin.selected.size ? `已选择 ${douyin.selected.size} 个作品` : "";
+});
+
+window.addEventListener("beforeunload", stopLoginPolling);
 
 ["dragenter", "dragover"].forEach((event) =>
   dropzone.addEventListener(event, (e) => {
@@ -474,4 +803,6 @@ $("sample-button").addEventListener("click", () => {
 );
 dropzone.addEventListener("drop", (event) => loadFile(event.dataTransfer.files[0]).catch((error) => showToast(error.message)));
 
-loadConfig().catch(() => showToast("无法读取本地配置，请确认服务已启动"));
+loadConfig()
+  .then(() => loadDouyinStatus(false))
+  .catch(() => showToast("无法读取本地配置，请确认服务已启动"));

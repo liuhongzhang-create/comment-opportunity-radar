@@ -5,3 +5,11 @@ __pycache__/
 .vscode/
 .env
 *.log
+
+# 抖音抓取用的虚拟环境（tools/setup-collector.sh 创建）
+.venv/
+.venv-*/
+
+# 抓取/导出的中间产物
+*-comments.csv
+评论商机分析-*.csv

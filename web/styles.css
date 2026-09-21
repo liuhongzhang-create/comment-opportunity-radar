@@ -100,8 +100,7 @@ tbody tr:hover { background: rgba(255,255,255,.018); }
 .key-status.bad { color: var(--danger); }
 .hint-note { margin: 10px 0 0; color: #778190; font-size: 12px; line-height: 1.65; }
 
-.advanced { margin-top: 24px; border: 1px solid var(--line); border-radius: 14px; background: rgba(8,11,15,.5); }
-.advanced summary { cursor: pointer; padding: 13px 16px; font-size: 13px; font-weight: 700; color: var(--muted); list-style: none; display: flex; align-items: center; gap: 8px; }
+.advanced { margin-top: 24px; border: 1px solid var(--line); border-radius: 14px; background: rgba(8,11,15,.5); }.advanced summary { cursor: pointer; padding: 13px 16px; font-size: 13px; font-weight: 700; color: var(--muted); list-style: none; display: flex; align-items: center; gap: 8px; }
 .advanced summary::-webkit-details-marker { display: none; }
 .advanced summary::before { content: "＋"; color: var(--signal); font-weight: 800; }
 .advanced[open] summary::before { content: "－"; }
@@ -123,6 +122,47 @@ tbody tr:hover { background: rgba(255,255,255,.018); }
 .error-cell { color: #ff9d90; line-height: 1.55; }
 .results-actions { flex-wrap: wrap; justify-content: flex-end; }
 .results-actions .secondary-button { min-height: 38px; font-size: 13px; }
+
+/* --- 数据来源切换与抖音抓取 --------------------------------------------- */
+
+.source-tabs { display: flex; gap: 8px; margin-top: 16px; }
+.source-tab { flex: 1; min-height: 42px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2); color: var(--muted); font-size: 13.5px; font-weight: 700; }
+.source-tab:hover { border-color: #596271; color: var(--text); }
+.source-tab.is-active { color: #0a0d0f; background: var(--signal); border-color: var(--signal); }
+.source-panel { margin-top: 16px; }
+
+.douyin-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: rgba(8,11,15,.5); }
+.douyin-status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.douyin-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #5b6472; }
+.douyin-status.ok { color: var(--signal); }
+.douyin-status.ok::before { background: var(--signal); box-shadow: 0 0 10px var(--signal); }
+.douyin-status.bad { color: var(--danger); }
+.douyin-status.bad::before { background: var(--danger); }
+.douyin-status.busy::before { background: var(--warning); animation: pulse 1.1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .28; } }
+.douyin-account { color: var(--text); font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
+
+.douyin-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.douyin-actions .secondary-button { min-height: 40px; font-size: 13px; }
+.douyin-actions .icon-button { min-height: 40px; font-size: 13px; }
+
+.works-shell { margin-top: 14px; border: 1px solid var(--line); border-radius: 13px; background: rgba(8,11,15,.5); overflow: hidden; }
+.works-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12.5px; }
+.check-inline { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; font-weight: 700; }
+.check-inline input { width: 16px; height: 16px; padding: 0; }
+.works-list { max-height: 260px; overflow-y: auto; }
+.work-item { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 11px 14px; border-bottom: 1px solid #1c222b; cursor: pointer; }
+.work-item:last-child { border-bottom: 0; }
+.work-item:hover { background: rgba(255,255,255,.02); }
+.work-item input { width: 16px; height: 16px; margin-top: 3px; padding: 0; }
+.work-title { font-size: 13.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.work-meta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12px; margin-top: 4px; }
+.work-badge { color: var(--muted); font-size: 12px; white-space: nowrap; border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; }
+.works-empty { padding: 16px 14px; color: var(--muted); font-size: 13px; }
+
+.douyin-options { margin-top: 16px; }
+.douyin-options input[type="checkbox"] { width: 18px; height: 18px; padding: 0; justify-self: start; }
+.warning-note { margin: 14px 0 0; padding: 12px 14px; border: 1px solid #5b4822; border-radius: 12px; background: rgba(255,191,68,.06); color: #d8c08a; font-size: 12px; line-height: 1.75; }
 
 @media (max-width: 900px) {
   .workspace { grid-template-columns: 1fr; padding-top: 48px; }

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="本地运行的 Jev 评论商机分析工具，将 CSV 评论整理为意图、购买概率和回复优先级。" />
+    <meta name="description" content="本地运行的评论商机雷达：直接抓取抖音作品评论，或用 Jev 分析 CSV 评论，输出意图、购买概率和回复优先级。" />
     <title>评论商机雷达</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -21,7 +21,7 @@
         <div class="intro">
           <p class="eyebrow">JEV-POWERED · LOCAL FIRST</p>
           <h1 id="page-title">从一堆评论里，<br />找出值得马上回复的人。</h1>
-          <p class="lede">导入 CSV，自动识别购买咨询、成交顾虑、内容需求与投诉，并按概率给出回复优先级；导出保留每条评论的原始身份信息。</p>
+          <p class="lede">登录抖音，选中要看的作品，自动抓取整个评论区，再识别购买咨询、成交顾虑、内容需求与投诉，按概率给出回复优先级；导出保留每条评论的原始身份与主页链接。</p>
         </div>
 
         <div class="setup-card">
@@ -42,22 +42,69 @@
           <div class="step-row file-step">
             <span class="step-number">02</span>
             <div>
-              <span class="label-like">导入评论</span>
-              <p id="max-rows-hint">支持 UTF-8 / GBK CSV，第一行为列名。</p>
+              <span class="label-like">获取评论</span>
+              <p>直接抓取抖音作品的评论区，或导入已有的 CSV。</p>
             </div>
           </div>
 
-          <label class="dropzone" id="dropzone" for="file-input">
-            <input id="file-input" type="file" accept=".csv,text/csv" />
-            <span class="drop-icon" aria-hidden="true">↗</span>
-            <strong id="drop-title">拖入 CSV，或点击选择</strong>
-            <span id="drop-meta">第一行为列名</span>
-          </label>
+          <div class="source-tabs" role="tablist">
+            <button id="source-tab-douyin" class="source-tab is-active" role="tab" type="button" aria-selected="true">抓取抖音评论</button>
+            <button id="source-tab-csv" class="source-tab" role="tab" type="button" aria-selected="false">导入 CSV 文件</button>
+          </div>
 
-          <div class="file-controls" id="file-controls" hidden>
-            <label for="text-column">评论所在列</label>
-            <select id="text-column"></select>
-            <div class="row-count"><b id="row-count">0</b> 条有效评论</div>
+          <div id="douyin-panel" class="source-panel">
+            <div class="douyin-bar">
+              <span id="douyin-status" class="douyin-status">检查抓取环境…</span>
+              <span id="douyin-account" class="douyin-account"></span>
+            </div>
+            <div class="douyin-actions">
+              <button id="douyin-login" class="secondary-button" type="button">打开浏览器登录抖音</button>
+              <button id="douyin-refresh" class="secondary-button" type="button" disabled>刷新作品列表</button>
+              <button id="douyin-shutdown" class="icon-button" type="button" hidden>关闭浏览器</button>
+            </div>
+            <p class="hint-note" id="douyin-setup-hint" hidden></p>
+
+            <div class="works-shell" id="works-shell" hidden>
+              <div class="works-head">
+                <label class="check-inline"><input id="works-select-all" type="checkbox" /> 全选</label>
+                <span id="works-summary"></span>
+              </div>
+              <div class="works-list" id="works-body"></div>
+            </div>
+
+            <div class="field-grid douyin-options">
+              <label for="douyin-max">每个作品最多抓取多少条评论</label>
+              <input id="douyin-max" type="number" min="20" max="2000" step="20" value="300" />
+              <label for="douyin-replies">尽量包含二级回复（实验特性）</label>
+              <input id="douyin-replies" type="checkbox" />
+            </div>
+
+            <div class="actions">
+              <button id="douyin-collect" class="primary-button" type="button" disabled>
+                <span>开始抓取</span><span aria-hidden="true">↓</span>
+              </button>
+            </div>
+            <p id="douyin-note" class="hint-note"></p>
+            <p class="warning-note">
+              ⚠️ 这个功能用你自己的账号、读你自己作品的评论，但自动化操作本身处于抖音服务条款的灰色地带，
+              节奏过快可能触发风控。工具已经把节奏放得很慢，请不要改成高频轮询；更看重合规的话，
+              可以直接用抖音创作者中心的「评论管理」导出，再走下面的 CSV 导入。
+            </p>
+          </div>
+
+          <div id="csv-panel" class="source-panel" hidden>
+            <label class="dropzone" id="dropzone" for="file-input">
+              <input id="file-input" type="file" accept=".csv,text/csv" />
+              <span class="drop-icon" aria-hidden="true">↗</span>
+              <strong id="drop-title">拖入 CSV，或点击选择</strong>
+              <span id="drop-meta">第一行为列名</span>
+            </label>
+
+            <div class="file-controls" id="file-controls" hidden>
+              <label for="text-column">评论所在列</label>
+              <select id="text-column"></select>
+              <div class="row-count"><b id="row-count">0</b> 条有效评论</div>
+            </div>
           </div>
           <p id="identity-note" class="hint-note"></p>
 
@@ -86,6 +133,8 @@
               </div>
             </div>
           </details>
+
+          <p class="hint-note" id="max-rows-hint">支持 UTF-8 / GBK CSV，第一行为列名。</p>
 
           <div class="actions">
             <button id="sample-button" class="secondary-button" type="button">载入示例</button>
