@@ -72,6 +72,16 @@
               <div class="works-list" id="works-body"></div>
             </div>
 
+            <div class="link-shell">
+              <div class="link-head">
+                <strong>或者：粘贴作品链接</strong>
+                <span class="link-sub">别人的作品也可以</span>
+              </div>
+              <textarea id="douyin-links" rows="3" spellcheck="false" autocomplete="off"
+                placeholder="https://www.douyin.com/video/7xxxxxxxxxxxxxxxxx&#10;也可以直接粘贴抖音的分享文案，会自动识别里面的链接"></textarea>
+              <p id="douyin-links-note" class="hint-note">支持作品链接、分享短链、纯数字作品 ID；每行一个，最多 50 个。</p>
+            </div>
+
             <div class="field-grid douyin-options">
               <label for="douyin-max">每个作品最多抓取多少条评论</label>
               <input id="douyin-max" type="number" min="20" max="2000" step="20" value="300" />
@@ -83,12 +93,15 @@
               <button id="douyin-collect" class="primary-button" type="button" disabled>
                 <span>开始抓取</span><span aria-hidden="true">↓</span>
               </button>
+              <button id="douyin-collect-links" class="secondary-button" type="button" disabled>
+                抓取链接里的作品
+              </button>
             </div>
             <p id="douyin-note" class="hint-note"></p>
             <p class="warning-note">
-              ⚠️ 这个功能用你自己的账号、读你自己作品的评论，但自动化操作本身处于抖音服务条款的灰色地带，
-              节奏过快可能触发风控。工具已经把节奏放得很慢，请不要改成高频轮询；更看重合规的话，
-              可以直接用抖音创作者中心的「评论管理」导出，再走下面的 CSV 导入。
+              ⚠️ 抓取用你自己的登录态，自动化操作本身处于抖音服务条款的灰色地带，节奏过快可能触发风控。
+              抓别人作品时请只用于公开数据的正当用途，不要用于骚扰、刷量或转卖。更看重合规的话，
+              可以用抖音创作者中心的「评论管理」导出自己作品的评论，再走下面的 CSV 导入。
             </p>
           </div>
 

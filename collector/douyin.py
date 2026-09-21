@@ -40,8 +40,28 @@ VIDEO_URL = f"{HOME_URL}/video/{{aweme_id}}"
 COMMENT_API = "/aweme/v1/web/comment/list/"
 REPLY_API = "/aweme/v1/web/comment/list/reply/"
 POSTS_API = "/aweme/v1/web/aweme/post/"
+# Fired by the video page itself; carries the authoritative title and author of
+# a video we did not reach through our own works list.
+VIDEO_DETAIL_API = "/aweme/v1/web/aweme/detail/"
 
 SESSION_COOKIES = ("sessionid", "sessionid_ss", "sid_tt")
+
+# --- link parsing -------------------------------------------------------------
+# Douyin hands out three shapes of video address and the share sheet wraps them
+# in prose ("7.85 复制打开抖音，看看【…】的作品 https://v.douyin.com/xxxx/"). All of
+# them have to land on the same numeric aweme_id.
+AWEME_ID_PATTERN = r"\d{15,25}"
+_ID_IN_PATH = re.compile(rf"/(?:video|note|share/video|slides)/({AWEME_ID_PATTERN})")
+_ID_IN_QUERY = re.compile(rf"(?:modal_id|aweme_id|item_ids|vid)=({AWEME_ID_PATTERN})")
+_BARE_ID = re.compile(rf"^{AWEME_ID_PATTERN}$")
+_URL_FINDER = re.compile(r"https?://[^\s,，;；、（）()【】\[\]<>\"'“”‘’|]+")
+# Hosts whose whole point is to be followed somewhere else. Matched as plain
+# substrings: "v.douyin.com" cannot legitimately appear inside a normal address,
+# and anchoring on `/` broke on the first path segment of an https:// URL.
+_SHARE_HOST = re.compile(r"v\.douyin\.com|v\.iesdouyin\.com|iesdouyin\.com/share", re.I)
+_DOUYIN_HOST = re.compile(r"douyin\.com", re.I)
+# Douyin puts the video title in <title> followed by this suffix.
+_PAGE_TITLE_SUFFIX = re.compile(r"\s*[-–—_]\s*抖音\s*$")
 
 # --- collection pacing --------------------------------------------------------
 # The old loop slept a fixed 1.3-2.4s after every wheel, so a 60-scroll run cost
@@ -137,6 +157,31 @@ class Work:
     @property
     def url(self) -> str:
         return VIDEO_URL.format(aweme_id=self.aweme_id)
+
+
+@dataclass(slots=True)
+class ParsedLinks:
+    """What a pasted blob of text turned out to contain.
+
+    `share_links` still need a network round trip to become ids, so they are
+    kept apart from `ids` instead of being guessed at.
+    """
+
+    ids: list[str] = field(default_factory=list)
+    share_links: list[str] = field(default_factory=list)
+    invalid: list[str] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.ids) + len(self.share_links)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ids": list(self.ids),
+            "shareLinks": list(self.share_links),
+            "invalid": list(self.invalid),
+            "total": self.total,
+        }
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -326,6 +371,106 @@ def extract_aweme_ids(html: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def aweme_id_from_url(url: str) -> str:
+    """The video id inside a Douyin address, or '' when there is none.
+
+    Accepts every shape the app and the web share sheet produce:
+    `/video/<id>`, `/note/<id>`, `?modal_id=<id>`, `?aweme_id=<id>`.
+    A profile or search address yields '' on purpose — the caller needs to tell
+    "this is not a video link" from "this is one but I could not read it".
+    """
+    if not url:
+        return ""
+    match = _ID_IN_PATH.search(url) or _ID_IN_QUERY.search(url)
+    return match.group(1) if match else ""
+
+
+def parse_video_input(text: str) -> ParsedLinks:
+    """Turn pasted text into video ids, short links and genuinely bad input.
+
+    Built for the share sheet's copy: one long sentence with the address buried
+    inside it. Ordinary prose in that sentence is ignored silently — only things
+    that *look* like an address but carry no video id are reported as invalid,
+    because those are the ones worth warning the user about.
+    """
+    raw = text or ""
+    result = ParsedLinks()
+    seen: set[str] = set()
+    seen_share: set[str] = set()
+
+    def keep_id(value: str) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            result.ids.append(value)
+
+    def keep_share(value: str) -> None:
+        if value and value not in seen_share:
+            seen_share.add(value)
+            result.share_links.append(value)
+
+    def absorb(token: str) -> None:
+        """Classify one address-ish token."""
+        found = aweme_id_from_url(token)
+        if found:
+            keep_id(found)
+            return
+        if _SHARE_HOST.search(token):
+            # v.douyin.com/<slug> — only the redirect knows the id.
+            keep_share(token if token.lower().startswith("http") else f"https://{token}")
+            return
+        result.invalid.append(token)
+
+    urls = _URL_FINDER.findall(raw)
+    for url in urls:
+        absorb(url.rstrip("。.,，、!！?？:："))
+
+    # Bare ids, and addresses pasted without a scheme.
+    rest = _URL_FINDER.sub(" ", raw)
+    for token in re.split(r"[\s,，;；、|]+", rest):
+        token = token.strip().strip("（）。.【】[]<>\"'“”‘’!！?？:：")
+        if not token:
+            continue
+        if _BARE_ID.match(token):
+            keep_id(token)
+        elif _DOUYIN_HOST.search(token):
+            absorb(token)
+
+    return result
+
+
+def parse_video_detail(payload: Any) -> dict[str, Any]:
+    """Title / author / counters from an `aweme/detail` body.
+
+    Needed for videos reached by link: there is no works list to supply the
+    title, and reading it off the page is unreliable on this SPA.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    detail = payload.get("aweme_detail")
+    if not isinstance(detail, dict):
+        nested = payload.get("data")
+        detail = nested if isinstance(nested, dict) else None
+    if not isinstance(detail, dict):
+        return {}
+    author = detail.get("author")
+    author = author if isinstance(author, dict) else {}
+    stats = detail.get("statistics")
+    stats = stats if isinstance(stats, dict) else {}
+    return {
+        "awemeId": str(detail.get("aweme_id") or "").strip(),
+        "title": clean_text(detail.get("desc")),
+        "author": clean_text(author.get("nickname")),
+        "commentCount": _as_int(stats.get("comment_count")),
+        "diggCount": _as_int(stats.get("digg_count")),
+        "createTime": _as_int(detail.get("create_time")),
+    }
+
+
+def clean_page_title(raw: str) -> str:
+    """`<title>` of a video page, minus the trailing brand suffix."""
+    return _PAGE_TITLE_SUFFIX.sub("", clean_text(raw))
+
+
 def parse_author_nickname(payload: Any) -> str:
     """Nickname of the account behind an `aweme/post` body.
 
@@ -479,6 +624,10 @@ class DouyinCollector:
         self._pw = None
         self._context = None
         self._page = None
+        # Titles/authors learned from `aweme/detail` while collecting. Videos
+        # reached by link have no works list to supply these, and the collected
+        # CSV needs a title per row.
+        self.video_meta: dict[str, dict[str, Any]] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -716,15 +865,23 @@ class DouyinCollector:
         max_comments: int = 500,
         max_scrolls: int | None = None,
         include_replies: bool = False,
+        title_hint: str = "",
         on_progress: Callable[[int, str], None] | None = None,
     ) -> list[Comment]:
-        """Scroll one video's comment panel and harvest what the page loads."""
+        """Scroll one video's comment panel and harvest what the page loads.
+
+        Works for any public video, not just your own: `title_hint` lets the
+        caller supply a title it already knows (from the works list), and
+        otherwise the title is taken from the page's own `aweme/detail` call.
+        """
         self.start()
         top_level: list[Comment] = []
         replies: list[Comment] = []
         seen: set[str] = set()
         videos_total = 0
         response_count = 0  # bumped per comment payload; drives the adaptive waits
+        title = clean_text(title_hint)
+        author = ""
 
         def absorb(comments: Iterable[Comment], bucket: list[Comment]) -> int:
             added = 0
@@ -737,9 +894,23 @@ class DouyinCollector:
             return added
 
         def on_response(response) -> None:
-            nonlocal videos_total, response_count
+            nonlocal videos_total, response_count, title, author
             url = response.url
-            if "douyin.com" not in url or "/comment/" not in url:
+            if "douyin.com" not in url:
+                return
+            if VIDEO_DETAIL_API in url:
+                try:
+                    payload = response.json()
+                except Exception:
+                    return
+                meta = parse_video_detail(payload)
+                if meta:
+                    self.video_meta[meta.get("awemeId") or aweme_id] = meta
+                    if not title:
+                        title = meta.get("title") or ""
+                    author = author or meta.get("author") or ""
+                return
+            if "/comment/" not in url:
                 return
             try:
                 payload = response.json()
@@ -775,9 +946,13 @@ class DouyinCollector:
                 timeout_ms=FIRST_COMMENT_WAIT_MS,
                 also_ready=self._comment_list_present,
             )
-            title = self._page_title()
-            if is_blocked_page(title):
+            raw_title = self._page_title()
+            if is_blocked_page(raw_title):
                 raise CollectorError("抖音返回了验证码页，请在浏览器窗口里过验证后重试。")
+            # Only fall back to the tab title when nothing better arrived; the
+            # detail call usually beats it and is never stale.
+            if not title:
+                title = clean_page_title(raw_title)
 
             # Aim the wheel at the comment scroller. Wheel events go to whatever
             # is under the cursor, so without this the page body can absorb them
@@ -826,10 +1001,59 @@ class DouyinCollector:
             except Exception:
                 pass
 
+        if title or author:
+            meta = self.video_meta.setdefault(aweme_id, {})
+            meta.setdefault("awemeId", aweme_id)
+            if title:
+                meta.setdefault("title", title)
+            if author:
+                meta.setdefault("author", author)
+
         top = dedupe_comments(top_level)[:max_comments]
         if not include_replies:
             return top
         return top + dedupe_comments(replies)
+
+    # -- links -------------------------------------------------------------
+
+    def resolve_share_links(
+        self, links: Iterable[str], *, on_progress: Callable[[str, str], None] | None = None
+    ) -> dict[str, str]:
+        """Map short share addresses (`v.douyin.com/xxx`) onto real video ids.
+
+        Uses the browser context's own request channel, so the redirect is
+        followed with the same cookies the page would carry — but without
+        opening a tab, which keeps it fast. A share address that answers with
+        the id directly needs no further work; one that does not gets a real
+        navigation as a last resort, because a wrong id is worse than a slow one.
+        """
+        self.start()
+        resolved: dict[str, str] = {}
+        for link in links:
+            found = ""
+            try:
+                response = self._context.request.get(link, max_redirects=0, timeout=20000)
+                found = aweme_id_from_url(response.headers.get("location", ""))
+                if not found:
+                    followed = self._context.request.get(link, max_redirects=5, timeout=20000)
+                    found = aweme_id_from_url(getattr(followed, "url", "") or "")
+            except Exception:
+                found = ""
+            if not found:
+                try:
+                    page = self._page
+                    page.goto(link, wait_until="domcontentloaded", timeout=45000)
+                    found = aweme_id_from_url(page.url) or ""
+                    if not found:
+                        ids = extract_aweme_ids(page.content() or "")
+                        found = ids[0] if ids else ""
+                except Exception:
+                    found = ""
+            if found:
+                resolved[link] = found
+            if on_progress is not None:
+                on_progress(link, found)
+        return resolved
 
     def _await_response(
         self,

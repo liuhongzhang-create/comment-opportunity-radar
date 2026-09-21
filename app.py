@@ -429,6 +429,9 @@ def analyze_rows(
 # ---------------------------------------------------------------------------
 
 MAX_COLLECT = 2000
+# One run visits every video in turn, so the ceiling is about wall-clock time
+# and risk-control exposure, not memory.
+MAX_LINKS = 50
 
 
 def collector_available() -> tuple[bool, str]:
@@ -509,6 +512,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_verify()
         elif self.path == "/api/douyin/login":
             self.handle_douyin_login()
+        elif self.path == "/api/douyin/links":
+            self.handle_douyin_links()
         elif self.path == "/api/douyin/collect":
             self.handle_douyin_collect()
         elif self.path == "/api/douyin/shutdown":
@@ -624,6 +629,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, {"ok": True, "status": douyin_status()})
 
+    def handle_douyin_links(self) -> None:
+        """Turn pasted links / share copy into video ids, before any collection."""
+        available, reason = collector_available()
+        if not available:
+            self.send_json(400, {"error": reason})
+            return
+        try:
+            payload = self.read_payload()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.send_json(400, {"error": str(error)})
+            return
+        text = str(payload.get("text") or "")
+        if not text.strip():
+            self.send_json(400, {"error": "请先粘贴作品链接"})
+            return
+        try:
+            result = collector_service().call("links", text=text, timeout=180)
+        except Exception as error:  # noqa: BLE001
+            self.send_json(200, {"ok": False, "error": str(error)})
+            return
+        ids = result.get("ids") or []
+        result.update({"ok": True, "overLimit": len(ids) > MAX_LINKS})
+        self.send_json(200, result)
+
     def handle_douyin_collect(self) -> None:
         available, reason = collector_available()
         if not available:
@@ -636,11 +665,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         aweme_ids = [str(x).strip() for x in (payload.get("awemeIds") or []) if str(x).strip()]
+        # Links are the alternative entry point: the UI resolves them first, but
+        # the server repeats the work so a bare-links request still works.
+        links_text = str(payload.get("links") or "").strip()
+        if not aweme_ids and links_text:
+            try:
+                preview = collector_service().call("links", text=links_text, timeout=300)
+            except Exception as error:  # noqa: BLE001
+                self.send_json(400, {"error": f"无法解析链接：{error}"})
+                return
+            aweme_ids = [str(x) for x in (preview.get("ids") or [])]
+            if not aweme_ids:
+                self.send_json(400, {"error": "没能在这些链接里找到抖音作品，请检查地址是否为作品链接"})
+                return
         if not aweme_ids:
-            self.send_json(400, {"error": "请先选择要抓取的作品"})
+            self.send_json(400, {"error": "请先选择要抓取的作品，或粘贴作品链接"})
             return
-        if len(aweme_ids) > 50:
-            self.send_json(400, {"error": "一次最多抓取 50 个作品，请减少后重试"})
+        if len(aweme_ids) > MAX_LINKS:
+            self.send_json(400, {"error": f"一次最多抓取 {MAX_LINKS} 个作品，请减少后重试"})
             return
 
         params = {

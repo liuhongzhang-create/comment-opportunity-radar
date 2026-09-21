@@ -345,7 +345,10 @@ const douyin = {
   selected: new Set(),
   busy: false,
   pollTimer: null,
+  links: [],
 };
+
+const LINK_HELP = "支持作品链接、分享短链、纯数字作品 ID；每行一个，最多 50 个。";
 
 function setDouyinStatus(text, kind) {
   const node = $("douyin-status");
@@ -353,11 +356,51 @@ function setDouyinStatus(text, kind) {
   node.className = `douyin-status${kind ? ` ${kind}` : ""}`;
 }
 
+function setLinkNote(text, kind) {
+  const node = $("douyin-links-note");
+  node.textContent = text || LINK_HELP;
+  node.className = `hint-note${kind ? ` ${kind}` : ""}`;
+}
+
+// 链接这条路不需要登录——公开作品的评论区匿名也能读，登录只是降低风控风险。
+// 所以按钮只按「有没有填内容」和「忙不忙」来决定，不挂登录态。
+function updateLinkState() {
+  const text = $("douyin-links").value.trim();
+  $("douyin-collect-links").disabled = douyin.busy || !text;
+  if (!text) {
+    douyin.links = [];
+    setLinkNote("");
+  }
+}
+
+async function resolveLinks(text) {
+  const response = await fetch("/api/douyin/links", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `解析失败（HTTP ${response.status}）`);
+  if (!payload.ok) throw new Error(payload.error || "解析失败");
+  return payload;
+}
+
+function describeLinks(payload) {
+  const parts = [`识别到 ${payload.total} 个作品`];
+  const short = Object.keys(payload.resolved || {}).length;
+  if (short) parts.push(`${short} 个来自分享短链`);
+  if ((payload.unresolved || []).length) parts.push(`${payload.unresolved.length} 个短链没能解析`);
+  if ((payload.invalid || []).length) parts.push(`${payload.invalid.length} 个地址不是作品链接，已忽略`);
+  if (payload.overLimit) parts.push("超过 50 个，只抓前 50 个");
+  return parts.join(" · ");
+}
+
 function setBusy(busy) {
   douyin.busy = busy;
   $("douyin-login").disabled = busy;
   $("douyin-refresh").disabled = busy || !(douyin.status && douyin.status.loggedIn);
   $("douyin-collect").disabled = busy || douyin.selected.size === 0;
+  updateLinkState();
   updateAnalyzeState();
 }
 
@@ -525,14 +568,57 @@ function renderWorks() {
   setBusy(douyin.busy);
 }
 
-async function collectDouyin() {
-  if (douyin.busy || !douyin.selected.size) return;
-  const awemeIds = Array.from(douyin.selected);
-  const works = douyin.works
-    .filter((work) => douyin.selected.has(work.awemeId))
-    .map((work) => ({ aweme_id: work.awemeId, desc: work.desc }));
-  const maxComments = clamp(Number($("douyin-max").value), 20, 2000);
-  const includeReplies = $("douyin-replies").checked;
+function readCollectOptions() {
+  return {
+    maxComments: clamp(Number($("douyin-max").value), 20, 2000),
+    includeReplies: $("douyin-replies").checked,
+  };
+}
+
+async function collectDouyin(mode) {
+  if (douyin.busy) return;
+  const options = readCollectOptions();
+  let job = null;
+
+  if (mode === "links") {
+    const text = $("douyin-links").value.trim();
+    if (!text) return;
+    // 先解析再抓：短链要跟一次跳转才知道是哪个作品，如果地址有问题，
+    // 现在就说清楚，别等浏览器开了半分钟才报错。
+    setBusy(true);
+    $("douyin-collect-links").textContent = "解析链接中…";
+    try {
+      const payload = await resolveLinks(text);
+      setLinkNote(describeLinks(payload), payload.total ? "ok" : "bad");
+      if (!payload.total) {
+        showToast("没能在这些链接里找到抖音作品，请检查地址是否为作品链接");
+        return;
+      }
+      const ids = (payload.ids || []).slice(0, 50);
+      douyin.links = ids;
+      job = { awemeIds: ids, works: [], links: text, label: `${ids.length} 个链接作品` };
+    } catch (error) {
+      setLinkNote(error.message, "bad");
+      showToast(error.message);
+      return;
+    } finally {
+      $("douyin-collect-links").textContent = "抓取链接里的作品";
+      setBusy(false);
+    }
+  } else {
+    if (!douyin.selected.size) return;
+    const awemeIds = Array.from(douyin.selected);
+    const works = douyin.works
+      .filter((work) => douyin.selected.has(work.awemeId))
+      .map((work) => ({ aweme_id: work.awemeId, desc: work.desc }));
+    job = { awemeIds, works, links: "", label: `${awemeIds.length} 个作品` };
+  }
+
+  await runCollect(job, options);
+}
+
+async function runCollect(job, options) {
+  const count = job.awemeIds.length;
   const startedAt = Date.now();
 
   setBusy(true);
@@ -541,14 +627,21 @@ async function collectDouyin() {
   $("table-shell").hidden = false;
   $("status-text").textContent = "正在抓取抖音评论";
   $("douyin-note").textContent = "正在打开视频页并滚动评论区，请勿关闭浏览器窗口…";
-  setProgress(0, awemeIds.length, `0 / ${awemeIds.length} 个作品`);
+  setProgress(0, count, `0 / ${count} 个作品`);
 
   let finished = null;
   try {
     const response = await fetch("/api/douyin/collect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ awemeIds, works, maxComments, includeReplies, stream: true }),
+      body: JSON.stringify({
+        awemeIds: job.awemeIds,
+        works: job.works,
+        links: job.links,
+        maxComments: options.maxComments,
+        includeReplies: options.includeReplies,
+        stream: true,
+      }),
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -558,7 +651,7 @@ async function collectDouyin() {
       if (event.type === "start") {
         setDouyinStatus(`准备抓取 ${event.works} 个作品`, "busy");
       } else if (event.type === "work") {
-        setProgress(event.index, awemeIds.length, `第 ${event.index + 1} / ${awemeIds.length} 个作品`);
+        setProgress(event.index, count, `第 ${event.index + 1} / ${count} 个作品`);
       } else if (event.type === "progress") {
         $("douyin-note").textContent = `已抓取 ${event.count} 条 · 当前作品：${(event.title || "").slice(0, 24)}`;
       } else if (event.type === "note") {
@@ -581,20 +674,19 @@ async function collectDouyin() {
 
   // 已经跑完了——把耗时一并报出来，否则用户无法判断是快是慢。
   const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const workCount = awemeIds.length;
 
   if (!finished || !finished.rows || !finished.rows.length) {
     // 区分「作品本来就没评论」和「抓取过程真的出错了」。原来一律提示
     // 「可能触发了风控」，会把只是还没人评论的作品说成账号出了事。
     const failed = (finished && finished.errors) || [];
     if (failed.length) {
-      $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · ${failed.length} 个抓取失败：${failed[0].error}`;
+      $("douyin-note").textContent = `${job.label} · 用时 ${elapsed} 秒 · ${failed.length} 个抓取失败：${failed[0].error}`;
       $("status-text").textContent = "抓取出错";
     } else if (finished && finished.skippedNoText) {
-      $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · 只找到 ${finished.skippedNoText} 条纯图片评论，没有可分析的文字。`;
+      $("douyin-note").textContent = `${job.label} · 用时 ${elapsed} 秒 · 只找到 ${finished.skippedNoText} 条纯图片评论，没有可分析的文字。`;
       $("status-text").textContent = "只有图片评论";
     } else {
-      $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · 这些作品目前还没有文字评论，没有可分析的内容。`;
+      $("douyin-note").textContent = `${job.label} · 用时 ${elapsed} 秒 · 这些作品目前还没有文字评论，没有可分析的内容。`;
       $("status-text").textContent = "没有抓到评论";
     }
     return;
@@ -606,7 +698,7 @@ async function collectDouyin() {
   // 前端还要按单次上限截断，所以用实际选中条数报数，避免两个数字打架。
   const toAnalyze = getSelectedRows().length;
   const capped = toAnalyze < finished.count ? `，本次送去筛选前 ${toAnalyze} 条（单次上限 ${finished.analyzeLimit}）` : "";
-  $("douyin-note").textContent = `${workCount} 个作品 · 用时 ${elapsed} 秒 · 抓到 ${finished.count} 条可分析评论${skipped}${capped}，正在送去筛选…`;
+  $("douyin-note").textContent = `${job.label} · 用时 ${elapsed} 秒 · 抓到 ${finished.count} 条可分析评论${skipped}${capped}，正在送去筛选…`;
   $("max-rows-hint").textContent = `本次抓到 ${finished.count} 条，单次最多分析 ${finished.analyzeLimit} 条`;
   // 用户要的就是「抓完自动筛选」，所以这里直接接上分析。
   await analyze();
@@ -782,7 +874,11 @@ $("source-tab-csv").addEventListener("click", () => selectSource("csv"));
 $("douyin-login").addEventListener("click", openDouyinLogin);
 $("douyin-refresh").addEventListener("click", () => loadWorks().catch((error) => showToast(error.message)));
 $("douyin-shutdown").addEventListener("click", shutdownDouyinBrowser);
-$("douyin-collect").addEventListener("click", collectDouyin);
+$("douyin-collect").addEventListener("click", () => collectDouyin("works"));
+$("douyin-collect-links").addEventListener("click", () => collectDouyin("links"));
+$("douyin-links").addEventListener("input", updateLinkState);
+// 粘贴之后立刻知道按钮能不能点，不用先点一次才发现是空的。
+$("douyin-links").addEventListener("paste", () => setTimeout(updateLinkState, 0));
 
 // Typing 10000 in the box used to just sit there looking accepted while the
 // server quietly clamped it to 2000. Snap the field to what will actually run.
@@ -801,7 +897,7 @@ $("works-body").addEventListener("change", (event) => {
   if (input.checked) douyin.selected.add(input.value);
   else douyin.selected.delete(input.value);
   $("works-select-all").checked = douyin.selected.size === douyin.works.length;
-  $("douyin-collect").disabled = douyin.busy || douyin.selected.size === 0;
+  setBusy(douyin.busy);
   $("douyin-note").textContent = douyin.selected.size
     ? `已选择 ${douyin.selected.size} 个作品`
     : "";
@@ -832,4 +928,5 @@ dropzone.addEventListener("drop", (event) => loadFile(event.dataTransfer.files[0
 
 loadConfig()
   .then(() => loadDouyinStatus(false))
+  .then(() => updateLinkState())
   .catch(() => showToast("无法读取本地配置，请确认服务已启动"));

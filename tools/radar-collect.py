@@ -8,11 +8,16 @@
     python3 tools/radar-collect.py works                  # 列出自己账号的作品
     python3 tools/radar-collect.py collect --aweme-id XXX --out comments.csv
     python3 tools/radar-collect.py collect --all --out comments.csv --max 300
+    python3 tools/radar-collect.py collect --link 'https://v.douyin.com/xxxx/' --out comments.csv
+
+`--link` 接受作品链接、分享短链或抖音那串分享文案，可以重复传，也可以直接粘
+`https://www.douyin.com/video/<id>` 这种地址——别人的作品一样能抓。
 
 抓完的 CSV 可以直接拖进网页界面（也可以单独使用）。
 
-请注意：本工具用你自己的账号、读你自己的数据，但自动化操作本身处于抖音服务条款的
-灰色地带，节奏过快可能触发风控。默认节奏已经放得很慢，请不要改成高频轮询。
+请注意：本工具用你自己的账号、读你自己能看到的数据，但自动化操作本身处于抖音服务条款的
+灰色地带，节奏过快可能触发风控。默认节奏已经放得很慢，请不要改成高频轮询。抓别人的作品
+时请只用于公开数据的正当用途。
 """
 
 from __future__ import annotations
@@ -114,7 +119,20 @@ def cmd_collect(args: argparse.Namespace) -> int:
     collector = douyin.DouyinCollector(headless=False)
     works_by_id: dict[str, douyin.Work] = {}
     try:
-        if args.all:
+        if args.link:
+            parsed = douyin.parse_video_input("\n".join(args.link))
+            targets = list(parsed.ids)
+            if parsed.invalid:
+                print(f"忽略 {len(parsed.invalid)} 个不是作品链接的地址：{parsed.invalid[:3]}")
+            if parsed.share_links:
+                print(f"解析 {len(parsed.share_links)} 个分享短链……")
+                resolved = collector.resolve_share_links(parsed.share_links)
+                for link in parsed.share_links:
+                    found = resolved.get(link)
+                    print(f"  {link} -> {found or '解析失败'}")
+                    if found and found not in targets:
+                        targets.append(found)
+        elif args.all:
             print("先取作品列表……")
             for work in collector.list_works(limit=args.limit):
                 works_by_id[work.aweme_id] = work
@@ -122,7 +140,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         elif args.aweme_id:
             targets = list(args.aweme_id)
         else:
-            print("请指定 --aweme-id，或加 --all 抓取全部作品。")
+            print("请指定 --aweme-id 或 --link，或加 --all 抓取全部作品。")
             return 2
         if not targets:
             print("没有可抓取的作品。")
@@ -136,6 +154,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
                     aweme_id,
                     max_comments=args.max,
                     include_replies=args.replies,
+                    title_hint=(works_by_id[aweme_id].desc if aweme_id in works_by_id else ""),
                     on_progress=_comment_progress,
                 )
             except douyin.CollectorError as exc:
@@ -145,6 +164,21 @@ def cmd_collect(args: argparse.Namespace) -> int:
             collected.extend(comments)
     finally:
         collector.stop()
+
+    # 链接进来的作品没有作品列表条目，标题是采集时从 aweme/detail 学到的。
+    for aweme_id, meta in collector.video_meta.items():
+        if aweme_id in works_by_id:
+            continue
+        title = str(meta.get("title") or "").strip()
+        if not title:
+            continue
+        works_by_id[aweme_id] = douyin.Work(
+            aweme_id=aweme_id,
+            desc=title,
+            comment_count=int(meta.get("commentCount") or 0),
+            digg_count=int(meta.get("diggCount") or 0),
+            create_time=int(meta.get("createTime") or 0),
+        )
 
     deduped = douyin.dedupe_comments(collected)
     analyzable, skipped_no_text = douyin.split_analyzable(deduped)
@@ -181,6 +215,12 @@ def main() -> int:
 
     p = sub.add_parser("collect", help="抓取指定作品（或全部作品）的评论")
     p.add_argument("--aweme-id", action="append", default=[], help="作品 ID，可重复传")
+    p.add_argument(
+        "--link",
+        action="append",
+        default=[],
+        help="作品链接 / 分享短链 / 分享文案，可重复传（别人的作品也可以）",
+    )
     p.add_argument("--all", action="store_true", help="抓取自己账号下全部作品")
     p.add_argument("--limit", type=int, default=60, help="配合 --all 时限制作品数")
     p.add_argument("--max", type=int, default=500, help="每个作品最多抓多少条评论")

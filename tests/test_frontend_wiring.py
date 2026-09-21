@@ -183,6 +183,36 @@ class DouyinWiringTests(unittest.TestCase):
                 self.assertIn(key, payload)
                 self.assertIn(key, APP_JS)
 
+    def test_the_links_endpoint_the_ui_calls_exists_in_the_server(self):
+        """粘贴链接这条路走的是单独一个接口，必须真的存在。"""
+        self.assertIn("/api/douyin/links", APP_JS)
+        self.assertIn('"/api/douyin/links"', (ROOT / "app.py").read_text(encoding="utf-8"))
+
+    def test_both_entry_points_have_a_button_and_a_handler(self):
+        self.assertIn('id="douyin-collect"', INDEX)
+        self.assertIn('id="douyin-collect-links"', INDEX)
+        for control in ("douyin-links", "douyin-links-note", "douyin-collect-links"):
+            with self.subTest(control=control):
+                self.assertIn(control, INDEX)
+
+    def test_the_two_buttons_pass_a_mode_instead_of_the_click_event(self):
+        """两个按钮共用一个函数；把 event 当参数传进去会静默走错分支。"""
+        self.assertIn('collectDouyin("works")', APP_JS)
+        self.assertIn('collectDouyin("links")', APP_JS)
+        self.assertNotIn('addEventListener("click", collectDouyin)', APP_JS)
+
+    def test_the_collect_payload_carries_links_so_the_server_can_recover(self):
+        self.assertIn("links: job.links", APP_JS)
+        server_source = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn('payload.get("links")', server_source)
+
+    def test_a_pasted_link_is_allowed_without_logging_in(self):
+        """公开作品的评论区匿名可读，所以按钮不该挂在登录态上。"""
+        block = re.search(r"function updateLinkState\(\)\s*\{(.*?)\n\}", APP_JS, re.S)
+        self.assertIsNotNone(block, "updateLinkState 不见了")
+        self.assertNotIn("loggedIn", block.group(1))
+        self.assertIn('$("douyin-links").value.trim()', block.group(1))
+
 
 class CrossLanguageContractTests(unittest.TestCase):
     def test_threshold_keys_match_the_backend(self):

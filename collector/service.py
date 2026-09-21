@@ -18,7 +18,7 @@ from typing import Any, Callable
 from . import douyin
 
 KNOWN_OPERATIONS = frozenset(
-    {"status", "login_open", "login_wait", "works", "collect", "doctor", "shutdown"}
+    {"status", "login_open", "login_wait", "works", "links", "collect", "doctor", "shutdown"}
 )
 
 
@@ -91,6 +91,10 @@ class CollectorService:
             raise ValueError(f"未知操作：{op}")
         if op == "status":
             return self._read_status(refresh=params.get("refresh", False))
+        if op == "links":
+            # Parsing plain addresses needs no browser at all, so this stays
+            # ahead of the collector: pasting a normal link must not open Chrome.
+            return self._links(params.get("text") or "")
 
         collector = self._ensure_collector()
         if op == "login_open":
@@ -171,6 +175,31 @@ class CollectorService:
         self._status.updated_at = time.time()
         return self._status.as_dict()
 
+    def _links(self, text: str) -> dict[str, Any]:
+        """Resolve pasted text (links, share copy, bare ids) into video ids."""
+        parsed = douyin.parse_video_input(text)
+        resolved: dict[str, str] = {}
+        if parsed.share_links:
+            # Only reach for the browser when a short address actually needs a
+            # redirect followed; a normal /video/<id> link never gets this far.
+            collector = self._ensure_collector()
+            resolved = collector.resolve_share_links(parsed.share_links)
+        ids = list(parsed.ids)
+        for link in parsed.share_links:
+            found = resolved.get(link)
+            if found and found not in ids:
+                ids.append(found)
+        payload = parsed.as_dict()
+        payload.update(
+            {
+                "ids": ids,
+                "resolved": resolved,
+                "unresolved": [link for link in parsed.share_links if link not in resolved],
+                "total": len(ids),
+            }
+        )
+        return payload
+
     def _collect(self, collector: douyin.DouyinCollector, params: dict[str, Any],
                  progress: Callable | None) -> dict[str, Any]:
         works = params.get("works") or []
@@ -209,6 +238,7 @@ class CollectorService:
                     aweme_id,
                     max_comments=int(params.get("maxComments", 500)),
                     include_replies=bool(params.get("includeReplies", False)),
+                    title_hint=known_title,
                     on_progress=on_progress,
                     **pins,
                 )
@@ -218,6 +248,23 @@ class CollectorService:
                 if progress is not None:
                     progress({"type": "error", "awemeId": aweme_id, "error": str(exc)})
                 continue
+
+        # Videos reached by link had no works entry, so their titles only turned
+        # up while collecting. Fold them in before building rows, otherwise the
+        # CSV's 作品标题 column comes out empty for exactly those videos.
+        for aweme_id, meta in collector.video_meta.items():
+            if aweme_id in works_by_id:
+                continue
+            desc = str(meta.get("title") or "").strip()
+            if not desc:
+                continue
+            works_by_id[aweme_id] = douyin.Work(
+                aweme_id=aweme_id,
+                desc=desc,
+                comment_count=int(meta.get("commentCount") or 0),
+                digg_count=int(meta.get("diggCount") or 0),
+                create_time=int(meta.get("createTime") or 0),
+            )
 
         deduped = douyin.dedupe_comments(all_comments)
         analyzable, skipped_no_text = douyin.split_analyzable(deduped)

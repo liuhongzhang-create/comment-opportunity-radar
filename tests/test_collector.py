@@ -518,6 +518,11 @@ class CollectProgressTitleTests(unittest.TestCase):
     """
 
     class _FakeCollector:
+        def __init__(self):
+            # The real collector records titles it learns from `aweme/detail`
+            # here; the service folds them in when titling link-sourced rows.
+            self.video_meta = {}
+
         def collect_comments(self, _aweme_id, **kwargs):
             kwargs["on_progress"](7, "从页面读到的滞后标题")
             return []
@@ -857,6 +862,234 @@ class CliProgressContractTests(unittest.TestCase):
         for name in re.findall(r"on_progress=(\w+)", source):
             callback = getattr(module, name)
             inspect.signature(callback).bind(1, "标题")
+
+
+class LinkInputTests(unittest.TestCase):
+    """Pasting a link is the other way in, and it has to survive the share sheet.
+
+    Douyin hands out `/video/<id>`, `/note/<id>`, `?modal_id=<id>` and the
+    `v.douyin.com` short form, and the app's share button wraps whichever one it
+    picked in a sentence. All of them must land on the same numeric id.
+    """
+
+    ID = "7682414198638398729"
+
+    def test_a_bare_id_is_accepted(self):
+        self.assertEqual(douyin.parse_video_input(self.ID).ids, [self.ID])
+
+    def test_the_plain_video_address_is_accepted(self):
+        parsed = douyin.parse_video_input(f"https://www.douyin.com/video/{self.ID}")
+        self.assertEqual(parsed.ids, [self.ID])
+        self.assertEqual(parsed.share_links, [])
+
+    def test_note_addresses_carry_the_same_id(self):
+        self.assertEqual(douyin.parse_video_input(f"https://www.douyin.com/note/{self.ID}").ids, [self.ID])
+
+    def test_query_style_addresses_are_accepted(self):
+        for url in (
+            f"https://www.douyin.com/video/{self.ID}?modal_id={self.ID}",
+            f"https://www.douyin.com/?aweme_id={self.ID}",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(douyin.parse_video_input(url).ids, [self.ID])
+
+    def test_a_short_share_link_is_kept_for_resolution_not_guessed(self):
+        parsed = douyin.parse_video_input("https://v.douyin.com/iRabcDe/")
+        self.assertEqual(parsed.ids, [])
+        self.assertEqual(parsed.share_links, ["https://v.douyin.com/iRabcDe/"])
+        self.assertEqual(parsed.invalid, [])
+
+    def test_a_share_address_that_already_carries_an_id_needs_no_round_trip(self):
+        parsed = douyin.parse_video_input(f"https://www.iesdouyin.com/share/video/{self.ID}/")
+        self.assertEqual(parsed.ids, [self.ID])
+        self.assertEqual(parsed.share_links, [])
+
+    def test_the_share_sheet_sentence_is_understood(self):
+        text = (
+            f"7.85 复制打开抖音，看看【某某某】的作品 我的新视频 "
+            f"https://v.douyin.com/iRabcDe/ 05/07 Abc:/"
+        )
+        parsed = douyin.parse_video_input(text)
+        self.assertEqual(parsed.share_links, ["https://v.douyin.com/iRabcDe/"])
+        # 句子里的中文不是地址，不该被当成错误输入报出来
+        self.assertEqual(parsed.invalid, [])
+
+    def test_chinese_punctuation_right_after_the_url_is_stripped(self):
+        parsed = douyin.parse_video_input(f"看这个 https://www.douyin.com/video/{self.ID}，很有意思")
+        self.assertEqual(parsed.ids, [self.ID])
+
+    def test_addresses_without_a_scheme_still_work(self):
+        parsed = douyin.parse_video_input(f"www.douyin.com/video/{self.ID}")
+        self.assertEqual(parsed.ids, [self.ID])
+
+    def test_several_links_in_one_blob_are_all_picked_up(self):
+        other = "7654321098765432109"
+        text = f"https://www.douyin.com/video/{self.ID}\n{other}\nhttps://www.douyin.com/video/{self.ID}"
+        parsed = douyin.parse_video_input(text)
+        # 去重，且保持出现顺序
+        self.assertEqual(parsed.ids, [self.ID, other])
+
+    def test_a_profile_link_is_reported_as_invalid_rather_than_silently_dropped(self):
+        parsed = douyin.parse_video_input("https://www.douyin.com/user/MS4wLjABAAAAxxxx")
+        self.assertEqual(parsed.ids, [])
+        self.assertEqual(len(parsed.invalid), 1)
+
+    def test_empty_input_yields_nothing(self):
+        for value in ("", "   ", None):
+            with self.subTest(value=value):
+                parsed = douyin.parse_video_input(value)
+                self.assertEqual((parsed.ids, parsed.share_links, parsed.invalid), ([], [], []))
+                self.assertEqual(parsed.total, 0)
+
+    def test_total_counts_both_kinds(self):
+        parsed = douyin.parse_video_input(f"{self.ID}\nhttps://v.douyin.com/iRabcDe/")
+        self.assertEqual(parsed.total, 2)
+        self.assertEqual(parsed.as_dict()["total"], 2)
+
+
+class VideoDetailTests(unittest.TestCase):
+    """Link-sourced videos have no works entry, so the title comes from here."""
+
+    def test_title_and_author_are_read_from_the_detail_payload(self):
+        meta = douyin.parse_video_detail(
+            {
+                "aweme_detail": {
+                    "aweme_id": "1234567890123456789",
+                    "desc": "第一行标题\n第二行",
+                    "create_time": 1700000000,
+                    "author": {"nickname": "某位作者"},
+                    "statistics": {"comment_count": 42, "digg_count": 777},
+                }
+            }
+        )
+        self.assertEqual(meta["awemeId"], "1234567890123456789")
+        self.assertEqual(meta["title"], "第一行标题\n第二行")
+        self.assertEqual(meta["author"], "某位作者")
+        self.assertEqual(meta["commentCount"], 42)
+        self.assertEqual(meta["diggCount"], 777)
+        self.assertEqual(meta["createTime"], 1700000000)
+
+    def test_a_payload_without_a_detail_is_ignored(self):
+        for payload in ({}, {"aweme_detail": None}, [], "nope", None):
+            with self.subTest(payload=payload):
+                self.assertEqual(douyin.parse_video_detail(payload), {})
+
+    def test_a_nested_data_wrapper_is_also_understood(self):
+        meta = douyin.parse_video_detail({"data": {"aweme_id": "9", "desc": "标题"}})
+        self.assertEqual(meta["title"], "标题")
+
+    def test_missing_counters_default_to_zero_rather_than_blowing_up(self):
+        meta = douyin.parse_video_detail({"aweme_detail": {"aweme_id": "9"}})
+        self.assertEqual(meta["commentCount"], 0)
+        self.assertEqual(meta["diggCount"], 0)
+        self.assertEqual(meta["title"], "")
+        self.assertEqual(meta["author"], "")
+
+
+class PageTitleTests(unittest.TestCase):
+    def test_the_brand_suffix_is_removed(self):
+        self.assertEqual(douyin.clean_page_title("《我被五Der包围了》 #tag - 抖音"), "《我被五Der包围了》 #tag")
+
+    def test_a_title_without_the_suffix_is_untouched(self):
+        self.assertEqual(douyin.clean_page_title("普通标题"), "普通标题")
+
+    def test_an_empty_title_stays_empty(self):
+        self.assertEqual(douyin.clean_page_title(""), "")
+
+
+class ServiceLinkResolutionTests(unittest.TestCase):
+    """`_links` must not open a browser unless a short link actually needs it."""
+
+    class _FakeCollector:
+        def __init__(self, resolved=None):
+            self.running = True
+            self.resolved = resolved or {}
+            self.resolve_calls = 0
+
+        def resolve_share_links(self, links):
+            self.resolve_calls += 1
+            return {link: self.resolved[link] for link in links if link in self.resolved}
+
+    def _service(self, resolved=None):
+        from collector.service import CollectorService
+
+        service = CollectorService(profile_dir="/tmp/radar-test-profile")
+        fake = self._FakeCollector(resolved)
+        service._collector = fake
+        return service, fake
+
+    def test_plain_links_never_touch_the_browser(self):
+        service, fake = self._service()
+        result = service._links(f"https://www.douyin.com/video/{'7' * 19}")
+        self.assertEqual(result["ids"], ["7" * 19])
+        self.assertEqual(fake.resolve_calls, 0)
+
+    def test_a_short_link_is_resolved_by_the_browser(self):
+        service, fake = self._service({"https://v.douyin.com/abc/": "7654321098765432109"})
+        result = service._links("https://v.douyin.com/abc/")
+        self.assertEqual(result["ids"], ["7654321098765432109"])
+        self.assertEqual(result["resolved"]["https://v.douyin.com/abc/"], "7654321098765432109")
+        self.assertEqual(result["unresolved"], [])
+        self.assertEqual(fake.resolve_calls, 1)
+
+    def test_a_short_link_that_fails_to_resolve_is_reported_not_dropped(self):
+        service, _fake = self._service()
+        result = service._links("https://v.douyin.com/gone/")
+        self.assertEqual(result["ids"], [])
+        self.assertEqual(result["unresolved"], ["https://v.douyin.com/gone/"])
+        self.assertEqual(result["total"], 0)
+
+    def test_short_links_and_plain_ids_are_merged_without_duplicates(self):
+        target = "7654321098765432109"
+        service, _fake = self._service({"https://v.douyin.com/abc/": target})
+        result = service._links(f"https://v.douyin.com/abc/\n{target}")
+        self.assertEqual(result["ids"], [target])
+
+    def test_the_links_operation_is_known_so_a_typo_cannot_launch_chrome(self):
+        from collector.service import KNOWN_OPERATIONS
+
+        self.assertIn("links", KNOWN_OPERATIONS)
+
+
+class LinkSourcedRowsTests(unittest.TestCase):
+    """Rows from a link must still say which video they came from."""
+
+    class _FakeCollector:
+        def __init__(self):
+            self.running = True
+            self.video_meta = {
+                "7654321098765432109": {
+                    "awemeId": "7654321098765432109",
+                    "title": "别人的作品标题",
+                    "author": "某位作者",
+                    "commentCount": 42,
+                    "diggCount": 7,
+                    "createTime": 1700000000,
+                }
+            }
+
+        def collect_comments(self, aweme_id, **kwargs):
+            return [
+                douyin.parse_comment(
+                    {"cid": "c1", "text": "怎么买？", "user": {"nickname": "小林", "uid": "u1"}},
+                    aweme_id=aweme_id,
+                )
+            ]
+
+    def test_the_title_learned_from_the_detail_call_lands_in_the_csv(self):
+        from collector.service import CollectorService
+
+        service = CollectorService(profile_dir="/tmp/radar-test-profile")
+        result = service._collect(
+            self._FakeCollector(),
+            {"awemeIds": ["7654321098765432109"], "works": [], "maxComments": 20},
+            None,
+        )
+        self.assertEqual(result["count"], 1)
+        row = result["rows"][0]
+        columns = dict(zip(douyin.CSV_HEADER, row))
+        self.assertEqual(columns["作品标题"], "别人的作品标题")
+        self.assertIn("7654321098765432109", columns["作品链接"])
 
 
 if __name__ == "__main__":
