@@ -16,6 +16,8 @@
 ### 新增
 
 - `tools/calibrate.py`：用带标注的 CSV 实测意图准确率，输出混淆矩阵、每类精确率/召回率、置信度阈值扫描与判错样本清单，并推荐 `review_confidence`。
+  - 已用真实 Key 跑通（24 条种子样本，意图准确率 95.8%，模型 `jev-1.13.0`）。
+  - 样本里没有低置信度条目时，扫描区间的最低档会"达标"，此时脚本会明确说明这个数只是扫描下界、不是真的分界点，避免误用。
 - `tools/sample_comments.csv`：24 条带标注的种子样本（含反话与阴阳怪气），用于验证校准流程。
 - 界面上「检查 Key」按钮：调用免费的 `GET /v1/models` 验证 Key，不消耗分析额度。
 - 界面上「重试失败项」按钮：只重跑失败的行。
@@ -25,10 +27,10 @@
 
 ### 测试
 
-- 从 5 个用例扩展到 **106 个**，且全部不依赖真实 API Key、不产生费用：
+- 从 5 个用例扩展到 **109 个**，且全部不依赖真实 API Key、不产生费用：
   - `tests/test_core.py`：44 项。新增 `normalize_result` 契约测试、阈值边界与非法输入、请求体字段级契约、重试策略分类、错误信息提取。
   - `tests/test_end_to_end.py`：21 项。启动真实服务 + 契约级假上游，覆盖参数校验、稀疏 `source_index`、流式事件序列、失败行隔离、529 退避重试、路径穿越防护、密钥不泄露。
-  - `tests/test_frontend_wiring.py`：14 项。静态校验脚本引用的元素 id 是否存在于页面、`core.js` 是否先于 `app.js` 加载、前端阈值键与后端 `THRESHOLD_BOUNDS` 是否一致。
+  - `tests/test_frontend_wiring.py`：17 项。静态校验脚本引用的元素 id 是否存在于页面、`core.js` 是否先于 `app.js` 加载、前端阈值键与后端 `THRESHOLD_BOUNDS` 是否一致，以及两条浏览器实测抓到的回归：`[hidden]` 是否被 author 的 `display` 规则覆盖、`.toast` 是否带 `pointer-events: none`。
   - `tests/web_core.test.cjs`：27 项。CSV 往返、公式注入防护、GBK/UTF-16/BOM 解码、导出矩阵与行号映射、排序稳定性。
 - `tests/fake_typesafe.py`：严格按官方响应契约实现的假上游，支持故障注入（`[unsure]` / `[reject]` / `[fail]` / `[retry]` / `[slow]`）。
 - `tools/run-tests.sh`：一键跑全部测试。

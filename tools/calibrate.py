@@ -156,8 +156,8 @@ def accuracy_report(records, results, target, min_coverage):
     print("\n置信度阈值扫描（决定有多少行需要人工复核）")
     print(f"{'阈值'.rjust(8)}{'自动放行'.rjust(10)}{'覆盖率'.rjust(10)}{'放行准确率'.rjust(12)}{'放行中判错'.rjust(12)}")
     recommendation = None
-    for step in range(4, 19):
-        threshold = step / 20  # 0.20 .. 0.90
+    scan = [step / 20 for step in range(4, 19)]  # 0.20 .. 0.90
+    for threshold in scan:
         auto = [(record, item) for record, item in pairs if item["intentConfidence"] >= threshold]
         if not auto:
             continue
@@ -176,6 +176,14 @@ def accuracy_report(records, results, target, min_coverage):
         print("没有阈值能同时满足目标。要么降低目标，要么把更多样本标成人工复核。")
     else:
         print(f"建议 review_confidence = {recommendation:.2f}（在页面「高级设置」里填写）")
+        if recommendation == scan[0]:
+            lowest = min(item["intentConfidence"] for _, item in pairs)
+            print(
+                f"  但这批样本里没有低置信度条目（最低 {lowest:.2f}），"
+                f"扫描区间的最低档就已经达标，"
+                "说明这个数只是扫描下界，不是真的分界点。"
+            )
+            print("  想拿到可用的阈值，样本里必须包含反话、讽刺、中英混排、纯表情这类模糊表达。")
 
     priority_pairs = [(record, item) for record, item in pairs if record.get("priority")]
     if priority_pairs:
