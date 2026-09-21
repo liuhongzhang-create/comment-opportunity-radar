@@ -21,7 +21,7 @@
         <div class="intro">
           <p class="eyebrow">JEV-POWERED · LOCAL FIRST</p>
           <h1 id="page-title">从一堆评论里，<br />找出值得马上回复的人。</h1>
-          <p class="lede">导入 CSV，自动识别购买咨询、成交顾虑、内容需求与投诉，并按概率给出回复优先级。</p>
+          <p class="lede">导入 CSV，自动识别购买咨询、成交顾虑、内容需求与投诉，并按概率给出回复优先级；导出保留每条评论的原始身份信息。</p>
         </div>
 
         <div class="setup-card">
@@ -35,13 +35,15 @@
           <div class="secret-field">
             <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..." />
             <button id="toggle-key" class="icon-button" type="button" aria-label="显示 API Key">显示</button>
+            <button id="verify-button" class="icon-button" type="button">检查 Key</button>
           </div>
+          <p id="key-status" class="key-status" role="status"></p>
 
           <div class="step-row file-step">
             <span class="step-number">02</span>
             <div>
               <span class="label-like">导入评论</span>
-              <p>支持 UTF-8 CSV，单次最多分析 500 条。</p>
+              <p id="max-rows-hint">支持 UTF-8 / GBK CSV，第一行为列名。</p>
             </div>
           </div>
 
@@ -57,6 +59,33 @@
             <select id="text-column"></select>
             <div class="row-count"><b id="row-count">0</b> 条有效评论</div>
           </div>
+          <p id="identity-note" class="hint-note"></p>
+
+          <details class="advanced">
+            <summary>高级设置（模型与阈值）</summary>
+            <div class="advanced-body">
+              <div class="field-grid">
+                <label for="model-input">模型 ID</label>
+                <input id="model-input" type="text" spellcheck="false" autocomplete="off" />
+                <label for="thr-review">置信度下限（低于则转人工复核）</label>
+                <input id="thr-review" type="number" step="0.05" min="0" max="1" />
+                <label for="thr-high-score">高优先级 · 购买意向分</label>
+                <input id="thr-high-score" type="number" step="0.1" min="0" max="4" />
+                <label for="thr-high-urgent">高优先级 · 尽快回复概率</label>
+                <input id="thr-high-urgent" type="number" step="0.05" min="0" max="1" />
+                <label for="thr-med-score">中优先级 · 购买意向分</label>
+                <input id="thr-med-score" type="number" step="0.1" min="0" max="4" />
+                <label for="thr-med-urgent">中优先级 · 尽快回复概率</label>
+                <input id="thr-med-urgent" type="number" step="0.05" min="0" max="1" />
+                <label for="concurrency-input">并发请求数</label>
+                <input id="concurrency-input" type="number" step="1" min="1" max="8" />
+              </div>
+              <div class="advanced-foot">
+                <p class="hint-note">默认模型钉在具体版本号上：官方说明调过阈值后应 pin 版本，别名升级会让阈值静默失效。阈值保存在本机浏览器，Key 不会保存。</p>
+                <button id="reset-settings" class="secondary-button" type="button">恢复默认阈值</button>
+              </div>
+            </div>
+          </details>
 
           <div class="actions">
             <button id="sample-button" class="secondary-button" type="button">载入示例</button>
@@ -64,7 +93,10 @@
               <span>开始分析</span><span aria-hidden="true">→</span>
             </button>
           </div>
-          <p class="cost-note">运行将使用你的 TypeSafe 额度。工具不会保存或上传 API Key 到其他服务器。</p>
+          <p class="cost-note">
+            运行将使用你的 TypeSafe 额度（输入约 $0.042 / 百万 token，输出免费）。工具不会保存或上传 API Key 到其他服务器。
+            <span id="endpoint-note"></span>
+          </p>
         </div>
       </section>
 
@@ -76,7 +108,18 @@
           </div>
           <div class="results-actions">
             <span id="status-text">等待导入评论</span>
+            <span id="elapsed"></span>
+            <span id="result-count"></span>
+            <button id="retry-button" class="secondary-button" type="button" hidden>重试失败项</button>
             <button id="export-button" class="secondary-button" type="button" hidden>导出 CSV</button>
+          </div>
+        </div>
+
+        <div class="progress-wrap" id="progress-wrap" hidden>
+          <div class="progress-track"><i id="progress-bar"></i></div>
+          <div class="progress-meta">
+            <span id="progress-label">0 / 0</span>
+            <span id="model-in-use"></span>
           </div>
         </div>
 
@@ -94,7 +137,9 @@
 
         <div class="table-shell" id="table-shell" hidden>
           <table>
-            <thead><tr><th>优先级</th><th>评论</th><th>主要意图</th><th>购买分</th><th>尽快回复</th><th>置信度</th></tr></thead>
+            <thead>
+              <tr><th>优先级</th><th>用户</th><th>评论</th><th>主要意图</th><th>购买分</th><th>尽快回复</th><th>置信度</th></tr>
+            </thead>
             <tbody id="results-body"></tbody>
           </table>
         </div>
@@ -102,6 +147,7 @@
     </main>
 
     <div class="toast" id="toast" role="status" hidden></div>
+    <script src="/core.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>
