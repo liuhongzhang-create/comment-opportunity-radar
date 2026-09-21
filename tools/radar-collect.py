@@ -27,13 +27,14 @@ sys.path.insert(0, str(ROOT))
 from collector import douyin  # noqa: E402
 
 
-def _progress(payload: dict) -> None:
-    if payload.get("type") == "progress":
-        print(f"\r  已抓 {payload['count']} 条", end="", flush=True)
-    elif payload.get("type") == "work":
-        print(f"\n→ 开始抓作品 {payload['awemeId']}")
-    elif payload.get("type") == "error":
-        print(f"\n  作品 {payload['awemeId']} 失败：{payload['error']}")
+def _comment_progress(count: int, _title: str = "") -> None:
+    """Progress callback for `collect_comments(count, title)`.
+
+    Note the shape: the collector hands back (count, title), not the service's
+    event dict. Passing a dict-shaped callback here used to raise TypeError the
+    moment a real collection started reporting progress.
+    """
+    print(f"\r  已抓 {count} 条", end="", flush=True)
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -135,7 +136,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
                     aweme_id,
                     max_comments=args.max,
                     include_replies=args.replies,
-                    on_progress=_progress,
+                    on_progress=_comment_progress,
                 )
             except douyin.CollectorError as exc:
                 print(f"\n  失败：{exc}")

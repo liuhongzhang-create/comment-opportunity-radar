@@ -768,6 +768,17 @@ $("douyin-refresh").addEventListener("click", () => loadWorks().catch((error) =>
 $("douyin-shutdown").addEventListener("click", shutdownDouyinBrowser);
 $("douyin-collect").addEventListener("click", collectDouyin);
 
+// Typing 10000 in the box used to just sit there looking accepted while the
+// server quietly clamped it to 2000. Snap the field to what will actually run.
+$("douyin-max").addEventListener("blur", (event) => {
+  const field = event.target;
+  const value = clamp(Number(field.value), 20, 2000);
+  if (field.value !== String(value)) {
+    field.value = String(value);
+    showToast(`单次抓取上限是 2000 条，已改为 ${value}`);
+  }
+});
+
 $("works-body").addEventListener("change", (event) => {
   const input = event.target;
   if (!input || input.type !== "checkbox") return;

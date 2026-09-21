@@ -194,12 +194,18 @@ class CollectorService:
             if progress is not None:
                 progress({"type": "work", "index": index, "awemeId": aweme_id})
             try:
+                # maxScrolls is only honoured when explicitly pinned; otherwise
+                # the collector derives a budget from maxComments, which is what
+                # makes the run stop as soon as it has what it came for.
+                pins = {}
+                if params.get("maxScrolls") not in (None, ""):
+                    pins["max_scrolls"] = int(params["maxScrolls"])
                 comments = collector.collect_comments(
                     aweme_id,
                     max_comments=int(params.get("maxComments", 500)),
-                    max_scrolls=int(params.get("maxScrolls", 60)),
                     include_replies=bool(params.get("includeReplies", False)),
                     on_progress=on_progress,
+                    **pins,
                 )
                 all_comments.extend(comments)
             except douyin.CollectorError as exc:

@@ -510,5 +510,316 @@ class EnvironmentProbeTests(unittest.TestCase):
             self.assertIn("error", info)
 
 
+class ParseAuthorNicknameTests(unittest.TestCase):
+    """The nickname must come from the payload, not the profile DOM.
+
+    Regression: the profile page's first line of body text is chrome such as
+    「开启读屏标签」, which the old fallback happily reported as the user's name.
+    """
+
+    def test_reads_nickname_from_first_work_author(self):
+        payload = {"aweme_list": [{"author": {"nickname": "天工造神局"}}]}
+        self.assertEqual(douyin.parse_author_nickname(payload), "天工造神局")
+
+    def test_skips_entries_without_an_author_until_one_has_a_name(self):
+        payload = {
+            "aweme_list": [
+                {"aweme_id": "1"},
+                {"author": {}},
+                {"author": {"nickname": "  第二个  "}},
+            ]
+        }
+        self.assertEqual(douyin.parse_author_nickname(payload), "第二个")
+
+    def test_never_invents_a_name_from_chrome_text(self):
+        # A payload that only carries UI labels must yield nothing at all.
+        self.assertEqual(douyin.parse_author_nickname({"aweme_list": []}), "")
+        self.assertEqual(douyin.parse_author_nickname({"aweme_list": "nope"}), "")
+        self.assertEqual(douyin.parse_author_nickname(None), "")
+        self.assertEqual(douyin.parse_author_nickname({"aweme_list": [{"author": {"nickname": ""}}]}), "")
+
+
+class ScrollBudgetTests(unittest.TestCase):
+    """The scroll budget is derived from the comment target.
+
+    Regression: the loop used a flat 60 scrolls of ~1.85s each = ~110s per work
+    no matter how few comments were wanted.
+    """
+
+    def test_small_target_does_not_spin_for_a_minute(self):
+        self.assertLessEqual(douyin.scroll_budget(20), 12)
+        self.assertLessEqual(douyin.scroll_budget(60), 12)
+
+    def test_budget_grows_with_the_target(self):
+        self.assertGreater(douyin.scroll_budget(500), douyin.scroll_budget(100))
+
+    def test_budget_is_clamped_at_both_ends(self):
+        self.assertGreaterEqual(douyin.scroll_budget(0), 12)
+        self.assertLessEqual(douyin.scroll_budget(10**9), 400)
+
+    def test_budget_covers_the_pages_needed(self):
+        # 20 comments per page, so 400 comments need 20 pages plus slack.
+        self.assertGreaterEqual(douyin.scroll_budget(400), 20)
+
+
+class AwaitResponseTests(unittest.TestCase):
+    """`_await_response` must pump the event loop, not sleep blindly.
+
+    With Playwright's sync API a plain `time.sleep` blocks delivery of the very
+    responses we wait for, so the helper has to drive `wait_for_timeout`.
+    """
+
+    def _collector(self):
+        return douyin.DouyinCollector(sleeper=lambda _s: None)
+
+    def test_returns_true_as_soon_as_the_counter_moves(self):
+        page = _FakePage()
+        state = {"n": 0}
+
+        # The counter ticks on the second pump: we must stop right there.
+        def counter():
+            state["n"] += 1
+            return 1 if state["n"] > 2 else 0
+
+        ok = self._collector()._await_response(page, counter, mark=0, timeout_ms=5000)
+        self.assertTrue(ok)
+        self.assertLess(page.pumped, 5, "should not keep waiting after data arrives")
+
+    def test_times_out_when_nothing_ever_arrives(self):
+        page = _FakePage()
+        ok = self._collector()._await_response(page, lambda: 0, mark=0, timeout_ms=300)
+        self.assertFalse(ok)
+        self.assertGreater(page.pumped, 0, "must still pump the loop while waiting")
+
+    def test_survives_a_page_that_closes_mid_wait(self):
+        page = _FakePage(raise_on_pump=True)
+        ok = self._collector()._await_response(page, lambda: 0, mark=0, timeout_ms=1000)
+        self.assertFalse(ok)
+
+
+class _FakePage:
+    """Minimal stand-in for `page.wait_for_timeout`."""
+
+    def __init__(self, raise_on_pump: bool = False) -> None:
+        self.pumped = 0
+        self._raise = raise_on_pump
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        self.pumped += 1
+        if self._raise:
+            raise RuntimeError("Target closed")
+
+
+class _FakeMouse:
+    def __init__(self, page: "_ScriptedPage") -> None:
+        self.page = page
+
+    def move(self, _x: float, _y: float) -> None:
+        self.page.moves += 1
+
+    def wheel(self, _dx: float, _dy: float) -> None:
+        self.page.wheeled += 1
+        # Ask the scripted site for one more comment page on the next pump.
+        self.page.pending += 1
+
+
+class _ScriptedPage:
+    """A fake Douyin video page that serves a fixed number of comment pages.
+
+    `wait_for_timeout` is the only place events get delivered, exactly like the
+    real Playwright sync API — which is what lets these tests prove the loop is
+    driven by incoming data rather than by fixed sleeps.
+    """
+
+    def __init__(self, pages: int = 3, per_page: int = 20, report_bottom: bool = False) -> None:
+        self.pages = pages
+        self.per_page = per_page
+        self.report_bottom = report_bottom
+        self.served = 0
+        self.pending = 0
+        self.pumps = 0
+        self.wheeled = 0
+        self.moves = 0
+        self._listeners = []
+        self.mouse = _FakeMouse(self)
+
+    # -- playwright surface ------------------------------------------------
+    def on(self, _event: str, callback) -> None:
+        self._listeners.append(callback)
+
+    def remove_listener(self, _event: str, callback) -> None:
+        if callback in self._listeners:
+            self._listeners.remove(callback)
+
+    def goto(self, _url: str, **_kwargs) -> None:
+        self.pending += 1  # the page loads its first comment batch by itself
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        self.pumps += 1
+        if self.pending:
+            self.pending -= 1
+            for callback in list(self._listeners):
+                callback(self)
+
+    def evaluate(self, _js: str):
+        # The at-bottom probe asks about scrollTop/clientHeight; the hover probe
+        # does not. Report "pinned to the end" once the scripted pages run out.
+        if "scrollTop" in _js and "clientHeight" in _js:
+            return self.report_bottom and self.served >= self.pages
+        return None
+
+    def title(self) -> str:
+        return "抖音 - 记录美好生活"
+
+    def close(self) -> None:
+        pass
+
+    # -- the fake response the listener receives ---------------------------
+    @property
+    def url(self) -> str:
+        return "https://www.douyin.com/aweme/v1/web/comment/list/?device_platform=webapp"
+
+    def json(self):
+        if self.served >= self.pages:
+            # Panel exhausted: the real site simply stops sending payloads.
+            return {"comments": [], "total": self.pages * self.per_page}
+        start = self.served * self.per_page
+        self.served += 1
+        return {
+            "total": self.pages * self.per_page,
+            "comments": [
+                {
+                    "cid": str(start + i),
+                    "text": f"评论{start + i}",
+                    "digg_count": 1,
+                    "create_time": 1700000000,
+                    "user": {"nickname": f"用户{start + i}", "uid": str(start + i)},
+                }
+                for i in range(self.per_page)
+            ],
+        }
+
+
+class CollectionLoopTests(unittest.TestCase):
+    """The scroll loop must be data-driven, not sleep-driven.
+
+    Regression: every tick slept a fixed 1.3-2.4s, so a 60-tick run cost ~110s
+    per work even when the page answered in milliseconds, and the loop never
+    noticed it already had everything the caller asked for.
+    """
+
+    def _collector_with(self, page: _ScriptedPage):
+        collector = douyin.DouyinCollector(sleeper=lambda _s: None)
+        collector._context = object()  # makes `running` true, skips the real launch
+        collector._page = page
+        return collector
+
+    def test_stops_as_soon_as_the_target_is_reached(self):
+        page = _ScriptedPage(pages=10, per_page=20)  # 200 comments available
+        collector = self._collector_with(page)
+        comments = collector.collect_comments("123", max_comments=40)
+
+        self.assertEqual(len(comments), 40)
+        # 40 comments = 2 pages; it must not paw through all 10.
+        self.assertLessEqual(page.served, 3, "kept scrolling after the target was met")
+
+    def test_exhausted_panel_ends_the_run_without_burning_the_budget(self):
+        page = _ScriptedPage(pages=2, per_page=20)  # only 40 comments exist
+        collector = self._collector_with(page)
+        comments = collector.collect_comments("123", max_comments=500)
+
+        self.assertEqual(len(comments), 40)
+        # Budget for 500 comments is ~33 ticks; a stalled panel must cut it short.
+        self.assertLess(
+            page.wheeled,
+            douyin.scroll_budget(500),
+            "ran the full scroll budget against an empty panel",
+        )
+
+    def test_fast_page_does_not_wait_the_old_fixed_amount(self):
+        page = _ScriptedPage(pages=2, per_page=20)
+        collector = self._collector_with(page)
+        collector.collect_comments("123", max_comments=20)
+
+        # Each pump stands in for one POLL_STEP_MS. The old loop waited >=1.3s
+        # per tick; here the whole run must stay in the low tens of pumps.
+        self.assertLess(page.pumps, 60, "still waiting around instead of moving on")
+
+    def test_video_with_no_comments_exits_promptly(self):
+        page = _ScriptedPage(pages=0, per_page=20)
+        collector = self._collector_with(page)
+        comments = collector.collect_comments("123", max_comments=300)
+
+        self.assertEqual(comments, [])
+        # Four stalled ticks is the cap; it must not grind through 60.
+        self.assertLess(page.wheeled, 12)
+
+    def test_scroller_pinned_at_the_end_ends_the_run_at_once(self):
+        # With a real bottom signal, one empty tick is enough. Without it the
+        # loop waits out the whole stall budget (~4 x SCROLL_WAIT_MS) on every
+        # fully-read video, which was pure dead time.
+        page = _ScriptedPage(pages=2, per_page=20, report_bottom=True)
+        collector = self._collector_with(page)
+        comments = collector.collect_comments("123", max_comments=500)
+
+        self.assertEqual(len(comments), 40)
+        self.assertLessEqual(
+            page.wheeled,
+            page.pages + 1,
+            "kept ticking after reaching the bottom of the comments",
+        )
+
+    def test_progress_callback_receives_count_and_title(self):
+        page = _ScriptedPage(pages=2, per_page=20)
+        collector = self._collector_with(page)
+        seen: list[tuple[int, str]] = []
+        collector.collect_comments(
+            "123",
+            max_comments=20,
+            on_progress=lambda count, title: seen.append((count, title)),
+        )
+
+        self.assertTrue(seen, "progress was never reported")
+        count, title = seen[0]
+        self.assertIsInstance(count, int)
+        self.assertIsInstance(title, str)
+
+
+class CliProgressContractTests(unittest.TestCase):
+    """The CLI's progress callback must match the collector's (count, title) shape.
+
+    Regression: radar-collect.py handed over a dict-shaped callback, so the
+    first real CLI collection died with "TypeError: _progress() takes 1
+    positional argument but 2 were given" — hidden until now because the launch
+    crash happened first.
+    """
+
+    def _load_cli(self):
+        import importlib.util
+
+        path = ROOT / "tools" / "radar-collect.py"
+        spec = importlib.util.spec_from_file_location("radar_collect_cli", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_cli_progress_callback_accepts_count_and_title(self):
+        import inspect
+
+        module = self._load_cli()
+        inspect.signature(module._comment_progress).bind(3, "某个作品")
+        self.assertTrue(callable(module._comment_progress))
+
+    def test_every_on_progress_callback_in_the_cli_has_the_right_arity(self):
+        import inspect
+        import re
+
+        source = (ROOT / "tools" / "radar-collect.py").read_text(encoding="utf-8")
+        module = self._load_cli()
+        for name in re.findall(r"on_progress=(\w+)", source):
+            callback = getattr(module, name)
+            inspect.signature(callback).bind(1, "标题")
+
+
 if __name__ == "__main__":
     unittest.main()

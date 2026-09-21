@@ -43,6 +43,23 @@ POSTS_API = "/aweme/v1/web/aweme/post/"
 
 SESSION_COOKIES = ("sessionid", "sessionid_ss", "sid_tt")
 
+# --- collection pacing --------------------------------------------------------
+# The old loop slept a fixed 1.3-2.4s after every wheel, so a 60-scroll run cost
+# ~110 seconds even when the network answered in 200ms. Instead we now wait for
+# the page's *own* comment response and move on the instant it lands, keeping a
+# small randomised floor so the pace still looks human. The wait values are
+# upper bounds, not sleeps: a fast network finishes far sooner.
+FIRST_COMMENT_WAIT_MS = 7000  # budget for the first comment page after navigation
+SCROLL_WAIT_MS = 1800  # budget for the next page after each wheel tick
+SCROLL_STEP = 2400  # pixels per wheel tick (was 1100, ~7 comments' worth)
+SCROLL_FLOOR = (0.10, 0.25)  # minimum human-ish gap between ticks
+POLL_STEP_MS = 120  # event-loop pump granularity while waiting
+STALL_LIMIT = 4  # consecutive empty waits before we call the panel exhausted
+# Douyin returns ~20 comments per page; this turns a target count into a scroll
+# budget instead of the old flat 60 regardless of how much was asked for.
+COMMENTS_PER_PAGE = 20
+SCROLLS_OVERHEAD = 8
+
 DEFAULT_PROFILE_DIR = Path(
     os.environ.get("RADAR_BROWSER_PROFILE", str(Path.home() / ".radar-douyin-profile"))
 )
@@ -309,6 +326,38 @@ def extract_aweme_ids(html: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def parse_author_nickname(payload: Any) -> str:
+    """Nickname of the account behind an `aweme/post` body.
+
+    Reading it from the response is authoritative, unlike scraping the profile
+    DOM, where the first line of body text can be a chrome string such as
+    「开启读屏标签」 rather than the user's name.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    for item in payload.get("aweme_list") or []:
+        if not isinstance(item, dict):
+            continue
+        author = item.get("author")
+        if isinstance(author, dict):
+            name = clean_text(author.get("nickname"))
+            if name:
+                return name
+    return ""
+
+
+def scroll_budget(max_comments: int, *, per_page: int = COMMENTS_PER_PAGE) -> int:
+    """Wheel ticks worth spending to reach `max_comments`.
+
+    Crooked on purpose: pages arrive in bursts and the final page rarely lands
+    exactly on the target, so we allow a margin. Clamped so a small target does
+    not spin and a huge one does not run forever.
+    """
+    target = max(1, int(max_comments))
+    pages = -(-target // max(1, per_page))  # ceil
+    return max(12, min(400, pages + SCROLLS_OVERHEAD))
+
+
 def comment_rows(comments: Iterable[Comment], works: dict[str, Work] | None = None) -> list[list[str]]:
     """Build the CSV matrix handed to the analyser.
 
@@ -553,21 +602,56 @@ class DouyinCollector:
         return False
 
     def whoami(self) -> str:
-        """Nickname of the logged-in account, or '' when not logged in."""
+        """Nickname of the logged-in account, or '' when not logged in.
+
+        Read from the account's own `aweme/post` payload, which is authoritative.
+        The profile DOM is a poor source: its first line of body text can be a
+        chrome string like 「开启读屏标签」, which is what the previous
+        first-line fallback reported as the user's name.
+        """
         if not self.running or not self.logged_in():
             return ""
+        found = ""
+
+        def on_response(response) -> None:
+            nonlocal found
+            if POSTS_API not in response.url:
+                return
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            name = parse_author_nickname(payload)
+            if name and not found:
+                found = name
+
+        page = self._page
+        page.on("response", on_response)
         try:
-            page = self._page
             page.goto(SELF_POSTS_URL, wait_until="domcontentloaded", timeout=45000)
-            self.pause(3.0, 4.0)
-            name = page.evaluate(
-                "() => { const el = document.querySelector('[data-e2e=\"user-title\"], .user-title');"
-                " if (el) return el.innerText.trim();"
-                " const m = document.body.innerText.match(/^(.{1,20})\\n/); return m ? m[1] : ''; }"
-            )
-            return clean_text(name)
+            waited = 0
+            while waited < FIRST_COMMENT_WAIT_MS and not found:
+                page.wait_for_timeout(POLL_STEP_MS)
+                waited += POLL_STEP_MS
+            if not found:
+                # Account has no works yet, so the payload never arrives. Fall
+                # back to an explicit nickname node only, never body text.
+                node_js = (
+                    "() => {"
+                    " const sel = ['[data-e2e=\"user-info\"] [data-e2e=\"user-title\"]',"
+                    " '[data-e2e=\"user-title\"]', '.user-info .user-name', '.user-name'].join(',');"
+                    " const el = document.querySelector(sel);"
+                    " return el ? el.innerText.trim() : ''; }"
+                )
+                found = clean_text(page.evaluate(node_js))
+            return found
         except Exception:
             return ""
+        finally:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
 
     # -- works -------------------------------------------------------------
 
@@ -576,14 +660,17 @@ class DouyinCollector:
         self.start()
         collected: list[Work] = []
         seen: set[str] = set()
+        response_count = 0
 
         def on_response(response) -> None:
+            nonlocal response_count
             if POSTS_API not in response.url:
                 return
             try:
                 payload = response.json()
             except Exception:
                 return
+            response_count += 1
             for work in parse_works_payload(payload):
                 if work.aweme_id in seen:
                     continue
@@ -594,17 +681,25 @@ class DouyinCollector:
         page.on("response", on_response)
         try:
             page.goto(SELF_POSTS_URL, wait_until="domcontentloaded", timeout=45000)
-            self.pause(4.0, 5.0)
+            self._await_response(page, lambda: response_count, mark=0, timeout_ms=FIRST_COMMENT_WAIT_MS)
             title = self._page_title()
             if is_blocked_page(title):
                 raise CollectorError("抖音返回了验证码页，请在浏览器窗口里过验证后重试。")
             if not self.logged_in():
                 raise CollectorError("还没有登录抖音。请先点「登录抖音」并用手机扫码。")
+            stall = 0
             for _ in range(max_scrolls):
                 if len(collected) >= limit:
                     break
-                page.mouse.wheel(0, 1200)
-                self.pause(1.6, 2.6)
+                mark = response_count
+                page.mouse.wheel(0, SCROLL_STEP)
+                if self._await_response(page, lambda: response_count, mark=mark, timeout_ms=SCROLL_WAIT_MS):
+                    stall = 0
+                else:
+                    stall += 1
+                self.pause(*SCROLL_FLOOR)
+                if stall >= STALL_LIMIT:
+                    break
         finally:
             try:
                 page.remove_listener("response", on_response)
@@ -619,7 +714,7 @@ class DouyinCollector:
         aweme_id: str,
         *,
         max_comments: int = 500,
-        max_scrolls: int = 60,
+        max_scrolls: int | None = None,
         include_replies: bool = False,
         on_progress: Callable[[int, str], None] | None = None,
     ) -> list[Comment]:
@@ -629,6 +724,7 @@ class DouyinCollector:
         replies: list[Comment] = []
         seen: set[str] = set()
         videos_total = 0
+        response_count = 0  # bumped per comment payload; drives the adaptive waits
 
         def absorb(comments: Iterable[Comment], bucket: list[Comment]) -> int:
             added = 0
@@ -641,7 +737,7 @@ class DouyinCollector:
             return added
 
         def on_response(response) -> None:
-            nonlocal videos_total
+            nonlocal videos_total, response_count
             url = response.url
             if "douyin.com" not in url or "/comment/" not in url:
                 return
@@ -651,6 +747,7 @@ class DouyinCollector:
                 return
             if REPLY_API in url:
                 absorb(parse_comment_payload(payload, aweme_id=aweme_id, source="reply"), replies)
+                response_count += 1
                 return
             if COMMENT_API not in url:
                 return
@@ -661,29 +758,59 @@ class DouyinCollector:
             for raw in payload.get("comments") or []:
                 if isinstance(raw, dict):
                     absorb(embedded_replies(raw, aweme_id=aweme_id), replies)
+            response_count += 1
 
         page = self._page
         page.on("response", on_response)
         try:
             page.goto(VIDEO_URL.format(aweme_id=aweme_id), wait_until="domcontentloaded", timeout=45000)
-            self.pause(5.0, 6.5)
+            # Wait for the first comment page instead of a blind 5-6.5s sleep:
+            # on a warm connection this returns in well under a second.
+            self._await_response(page, lambda: response_count, mark=0, timeout_ms=FIRST_COMMENT_WAIT_MS)
             title = self._page_title()
             if is_blocked_page(title):
                 raise CollectorError("抖音返回了验证码页，请在浏览器窗口里过验证后重试。")
 
+            # Aim the wheel at the comment scroller. Wheel events go to whatever
+            # is under the cursor, so without this the page body can absorb them
+            # and no new comments load at all (looks exactly like "very slow").
+            self._hover_comment_panel()
+
+            budget = max_scrolls if max_scrolls is not None else scroll_budget(max_comments)
             stall = 0
-            for _ in range(max_scrolls):
-                before = len(top_level)
-                page.mouse.wheel(0, 1100)
-                self.pause(1.3, 2.4)
+            for _ in range(budget):
+                mark = response_count
+                before = len(top_level) + len(replies)
+                page.mouse.wheel(0, SCROLL_STEP)
+                # Move on the moment the page's own payload lands, instead of
+                # sleeping a fixed amount and hoping it was enough.
+                self._await_response(page, lambda: response_count, mark=mark, timeout_ms=SCROLL_WAIT_MS)
+                # Progress is measured in *new comments*, not in responses: an
+                # exhausted panel can keep answering with empty pages, and
+                # counting those would never look like a stall.
+                grew = len(top_level) + len(replies) > before
+                if grew:
+                    stall = 0
+                else:
+                    stall += 1
+                    # Pinned to the end with nothing new means there is nothing
+                    # left to load: stop now instead of waiting out the budget.
+                    if self._at_scroll_bottom():
+                        break
+                self.pause(*SCROLL_FLOOR)  # keep a human-ish floor between ticks
                 if include_replies:
                     self._expand_replies()
                 if on_progress is not None:
                     on_progress(len(top_level) + len(replies), title)
+                # Stop as soon as the target is met, or once the reported total
+                # has all arrived, or after repeated empty waits. The empty-wait
+                # break is unconditional: the initial wait above already gave the
+                # first page its chance, so a stalled panel means we are done.
                 if len(top_level) >= max_comments:
                     break
-                stall = stall + 1 if len(top_level) == before else 0
-                if stall >= 4 and len(top_level) > 0:
+                if videos_total and len(top_level) >= videos_total:
+                    break
+                if stall >= STALL_LIMIT:
                     break
         finally:
             try:
@@ -695,6 +822,128 @@ class DouyinCollector:
         if not include_replies:
             return top
         return top + dedupe_comments(replies)
+
+    def _await_response(
+        self,
+        page,
+        counter: Callable[[], int],
+        *,
+        mark: int,
+        timeout_ms: int,
+    ) -> bool:
+        """Pump the event loop until a response lands past `mark`, else time out.
+
+        `page.wait_for_timeout` is what dispatches Playwright's events, so a
+        plain `time.sleep` here would stall delivery of the very responses we
+        are waiting for. Returns True if new data arrived.
+        """
+        waited = 0
+        guard = 0
+        while waited < timeout_ms:
+            if counter() > mark:
+                return True
+            step = min(POLL_STEP_MS, timeout_ms - waited)
+            try:
+                page.wait_for_timeout(step)
+            except Exception:
+                return counter() > mark
+            waited += step
+            guard += 1
+            if guard > 400:  # belt and braces against a pathological clock
+                break
+        return counter() > mark
+
+    COMMENT_LIST_SELECTOR = '[data-e2e="comment-list"], [data-e2e="comment-item"]'
+
+    COMMENT_PANEL_JS = """
+    () => {
+      const hittable = (el) => {
+        const style = getComputedStyle(el);
+        if (!/(auto|scroll)/.test(style.overflowY)) return 0;
+        return el.scrollHeight - el.clientHeight;
+      };
+      // Preferred: walk up from the comment list to whoever actually scrolls it.
+      // On the current layout that is the page-level route container, not an
+      // inner panel, so a "panel on the right half" guess finds nothing.
+      let node = document.querySelector('[data-e2e="comment-list"], [data-e2e="comment-item"]');
+      while (node && node !== document.body) {
+        if (hittable(node) > 40) {
+          const r = node.getBoundingClientRect();
+          return {
+            x: r.left + r.width / 2,
+            y: r.top + Math.min(r.height / 2, 260),
+            how: 'comment-ancestor',
+          };
+        }
+        node = node.parentElement;
+      }
+      // Fallback: the deepest scrollable box that is not the left nav rail.
+      let best = null;
+      for (const el of document.querySelectorAll('div, main, section')) {
+        if (hittable(el) < 300) continue;
+        if (el.closest('[data-e2e="douyin-navigation"]')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 300 || r.height < 300) continue;
+        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      }
+      if (!best) return null;
+      const r = best.getBoundingClientRect();
+      return {
+        x: r.left + r.width / 2,
+        y: r.top + Math.min(r.height / 2, 260),
+        how: 'largest-scroller',
+      };
+    }
+    """
+
+    def _hover_comment_panel(self) -> bool:
+        """Park the cursor over whatever actually scrolls the comment list.
+
+        Wheel events only reach the scroller under the cursor, so without this
+        the page body can absorb every tick and nothing new loads — which looks
+        exactly like "the scraper is very slow".
+        """
+        try:
+            box = self._page.evaluate(self.COMMENT_PANEL_JS)
+        except Exception:
+            return False
+        if not isinstance(box, dict):
+            return False
+        try:
+            self._page.mouse.move(box["x"], box["y"])
+            return True
+        except Exception:
+            return False
+
+    AT_BOTTOM_JS = """
+    () => {
+      const hittable = (el) => {
+        const style = getComputedStyle(el);
+        if (!/(auto|scroll)/.test(style.overflowY)) return 0;
+        return el.scrollHeight - el.clientHeight;
+      };
+      let node = document.querySelector('[data-e2e="comment-list"], [data-e2e="comment-item"]');
+      while (node && node !== document.body) {
+        if (hittable(node) > 40) break;
+        node = node.parentElement;
+      }
+      if (!node || node === document.body) return false;
+      // A few pixels of slack: sub-pixel layout and lazy-load spinners mean the
+      // scroller rarely reports an exact 0 remaining.
+      return node.scrollTop + node.clientHeight >= node.scrollHeight - 8;
+    }
+    """
+
+    def _at_scroll_bottom(self) -> bool:
+        """True when the comment scroller is pinned to its end.
+
+        Used to end the run on the first empty tick instead of waiting out the
+        stall budget, which is pure dead time on a fully-read video.
+        """
+        try:
+            return bool(self._page.evaluate(self.AT_BOTTOM_JS))
+        except Exception:
+            return False
 
     def _expand_replies(self) -> int:
         """Best-effort: click 「展开N条回复」 so the page fetches reply pages.

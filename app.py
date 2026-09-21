@@ -647,9 +647,13 @@ class Handler(BaseHTTPRequestHandler):
             "awemeIds": aweme_ids,
             "works": payload.get("works") or [],
             "maxComments": max(1, min(MAX_COLLECT, int(payload.get("maxComments") or 300))),
-            "maxScrolls": max(2, min(400, int(payload.get("maxScrolls") or 60))),
             "includeReplies": bool(payload.get("includeReplies")),
         }
+        # Leave maxScrolls unpinned unless the caller asks for it: the collector
+        # then sizes the scroll budget to the comment target and stops early.
+        raw_scrolls = payload.get("maxScrolls")
+        if raw_scrolls not in (None, ""):
+            params["maxScrolls"] = max(2, min(400, int(raw_scrolls)))
         try:
             self.stream_douyin_collect(params)
         except Exception as error:  # noqa: BLE001 - headers may already be sent
